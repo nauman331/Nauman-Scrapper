@@ -1,0 +1,89 @@
+services:
+  # REST API Server
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: scraper-api
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    environment:
+      - NODE_ENV=production
+      - PORT=3000
+      - HOST=0.0.0.0
+      - DATABASE_URL=file:/app/data/scrape.db
+      - API_KEY=${API_KEY:-dev-scrape-secret-key-2026}
+      - QUEUE_ADAPTER=redis
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - LOG_LEVEL=info
+    volumes:
+      - scraper_data:/app/data
+    depends_on:
+      redis:
+        condition: service_healthy
+
+  # Dedicated Background Scraping Worker Fleet
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: ["node", "dist/worker-runner.js"]
+    restart: unless-stopped
+    deploy:
+      replicas: 2 # Scale workers independently for high-volume crawling
+    environment:
+      - NODE_ENV=production
+      - DATABASE_URL=file:/app/data/scrape.db
+      - QUEUE_ADAPTER=redis
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - LOG_LEVEL=info
+      - DEFAULT_CONCURRENCY=5
+    volumes:
+      - scraper_data:/app/data
+    depends_on:
+      redis:
+        condition: service_healthy
+
+  # Redis for BullMQ distributed job scheduling & worker coordination
+  redis:
+    image: redis:7-alpine
+    container_name: scraper-redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  # Optional MySQL database service (if using MySQL instead of local scrape.db)
+  # To use: update DATABASE_URL=mysql://root:rootpassword@mysql:3306/scrapedb in .env
+  mysql:
+    image: mysql:8.0
+    container_name: scraper-mysql
+    restart: unless-stopped
+    ports:
+      - "3306:3306"
+    environment:
+      MYSQL_ROOT_PASSWORD: rootpassword
+      MYSQL_DATABASE: scrapedb
+    volumes:
+      - mysql_data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    profiles:
+      - with-mysql # Start with `docker compose --profile with-mysql up`
+
+volumes:
+  scraper_data:
+  redis_data:
+  mysql_data:

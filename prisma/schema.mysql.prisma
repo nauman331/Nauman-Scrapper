@@ -1,0 +1,115 @@
+// MySQL Schema alternative for live MySQL deployments
+// Usage: npx prisma db push --schema=prisma/schema.mysql.prisma
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "mysql"
+  url      = env("DATABASE_URL")
+}
+
+model ScrapeJob {
+  id                    String        @id @default(cuid())
+  name                  String?
+  targetUrl             String        @db.VarChar(2048)
+  domain                String        @db.VarChar(255)
+  strategy              String        @default("AUTO") @db.VarChar(32) // AUTO, CHEERIO, PLAYWRIGHT
+  status                String        @default("PENDING") @db.VarChar(32) // PENDING, RUNNING, COMPLETED, PARTIALLY_COMPLETED, FAILED, CANCELLED
+  priority              Int           @default(0)
+  maxDepth              Int           @default(1)
+  maxPages              Int           @default(10)
+  requestTimeoutMs      Int           @default(30000)
+  retryLimit            Int           @default(3)
+  extractionConfig      String        @db.LongText
+  domainPolicyId        String?
+  totalPagesCrawled     Int           @default(0)
+  totalResultsExtracted Int           @default(0)
+  errorMessage          String?       @db.Text
+  createdAt             DateTime      @default(now())
+  updatedAt             DateTime      @updatedAt
+  startedAt             DateTime?
+  finishedAt            DateTime?
+
+  domainPolicy          DomainPolicy? @relation(fields: [domainPolicyId], references: [id], onDelete: SetNull)
+  attempts              JobAttempt[]
+  crawledPages          CrawledPage[]
+  results               ScrapeResult[]
+
+  @@index([status])
+  @@index([domain])
+  @@index([createdAt])
+}
+
+model JobAttempt {
+  id            String    @id @default(cuid())
+  jobId         String
+  attemptNumber Int
+  status        String    @default("RUNNING") @db.VarChar(32)
+  workerId      String?   @db.VarChar(255)
+  errorMessage  String?   @db.Text
+  startedAt     DateTime  @default(now())
+  finishedAt    DateTime?
+
+  job           ScrapeJob @relation(fields: [jobId], references: [id], onDelete: Cascade)
+
+  @@index([jobId])
+}
+
+model CrawledPage {
+  id              String         @id @default(cuid())
+  jobId           String
+  url             String         @db.VarChar(2048)
+  canonicalUrl    String?        @db.VarChar(2048)
+  httpStatus      Int?
+  responseTimeMs  Int?
+  contentType     String?        @db.VarChar(128)
+  byteSize        Int?
+  depth           Int            @default(0)
+  crawlerStrategy String         @default("CHEERIO") @db.VarChar(32)
+  error           String?        @db.Text
+  crawledAt       DateTime       @default(now())
+
+  job             ScrapeJob      @relation(fields: [jobId], references: [id], onDelete: Cascade)
+  results         ScrapeResult[]
+
+  @@index([jobId, depth])
+}
+
+model ScrapeResult {
+  id               String       @id @default(cuid())
+  jobId            String
+  crawledPageId    String?
+  url              String       @db.VarChar(2048)
+  urlHash          String       @db.VarChar(64)
+  title            String?      @db.VarChar(512)
+  description      String?      @db.Text
+  rawData          String       @db.LongText
+  normalizedData   String       @db.LongText
+  validationPassed Boolean      @default(true)
+  validationErrors String?      @db.Text
+  extractedAt      DateTime     @default(now())
+
+  job              ScrapeJob    @relation(fields: [jobId], references: [id], onDelete: Cascade)
+  crawledPage      CrawledPage? @relation(fields: [crawledPageId], references: [id], onDelete: SetNull)
+
+  @@unique([jobId, urlHash])
+  @@index([jobId])
+  @@index([urlHash])
+}
+
+model DomainPolicy {
+  id             String      @id @default(cuid())
+  domain         String      @unique @db.VarChar(255)
+  maxConcurrency Int         @default(2)
+  minDelayMs     Int         @default(1000)
+  allowed        Boolean     @default(true)
+  userAgent      String?     @db.VarChar(512)
+  createdAt      DateTime    @default(now())
+  updatedAt      DateTime    @updatedAt
+
+  jobs           ScrapeJob[]
+
+  @@index([domain])
+}

@@ -1,0 +1,130 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+model ScrapeJob {
+  id                    String        @id @default(cuid())
+  name                  String?
+  targetUrl             String
+  domain                String
+  strategy              String        @default("AUTO") // AUTO, CHEERIO, PLAYWRIGHT
+  status                String        @default("PENDING") // PENDING, RUNNING, COMPLETED, PARTIALLY_COMPLETED, FAILED, CANCELLED
+  priority              Int           @default(0)
+  maxDepth              Int           @default(1)
+  maxPages              Int           @default(10)
+  requestTimeoutMs      Int           @default(30000)
+  retryLimit            Int           @default(3)
+  extractionConfig      String        @default("{}") // JSON config
+  domainPolicyId        String?
+  proxyId               String?
+  totalPagesCrawled     Int           @default(0)
+  totalResultsExtracted Int           @default(0)
+  errorMessage          String?
+  createdAt             DateTime      @default(now())
+  updatedAt             DateTime      @updatedAt
+  startedAt             DateTime?
+  finishedAt            DateTime?
+
+  domainPolicy          DomainPolicy? @relation(fields: [domainPolicyId], references: [id], onDelete: SetNull)
+  proxy                 Proxy?        @relation(fields: [proxyId], references: [id], onDelete: SetNull)
+  attempts              JobAttempt[]
+  crawledPages          CrawledPage[]
+  results               ScrapeResult[]
+
+  @@index([status])
+  @@index([domain])
+  @@index([proxyId])
+  @@index([createdAt])
+}
+
+model JobAttempt {
+  id            String    @id @default(cuid())
+  jobId         String
+  attemptNumber Int
+  status        String    @default("RUNNING") // RUNNING, COMPLETED, FAILED
+  workerId      String?
+  errorMessage  String?
+  startedAt     DateTime  @default(now())
+  finishedAt    DateTime?
+
+  job           ScrapeJob @relation(fields: [jobId], references: [id], onDelete: Cascade)
+
+  @@index([jobId])
+}
+
+model CrawledPage {
+  id              String         @id @default(cuid())
+  jobId           String
+  url             String
+  canonicalUrl    String?
+  httpStatus      Int?
+  responseTimeMs  Int?
+  contentType     String?
+  byteSize        Int?
+  depth           Int            @default(0)
+  crawlerStrategy String         @default("CHEERIO")
+  error           String?
+  crawledAt       DateTime       @default(now())
+
+  job             ScrapeJob      @relation(fields: [jobId], references: [id], onDelete: Cascade)
+  results         ScrapeResult[]
+
+  @@index([jobId, url])
+  @@index([jobId, depth])
+}
+
+model ScrapeResult {
+  id               String       @id @default(cuid())
+  jobId            String
+  crawledPageId    String?
+  url              String
+  urlHash          String
+  title            String?
+  description      String?
+  rawData          String       @default("{}") // Raw extracted JSON
+  normalizedData   String       @default("{}") // Normalized JSON
+  validationPassed Boolean      @default(true)
+  validationErrors String?      // JSON validation errors if any
+  extractedAt      DateTime     @default(now())
+
+  job              ScrapeJob    @relation(fields: [jobId], references: [id], onDelete: Cascade)
+  crawledPage      CrawledPage? @relation(fields: [crawledPageId], references: [id], onDelete: SetNull)
+
+  @@unique([jobId, urlHash])
+  @@index([jobId])
+  @@index([urlHash])
+}
+
+model DomainPolicy {
+  id             String      @id @default(cuid())
+  domain         String      @unique
+  maxConcurrency Int         @default(2)
+  minDelayMs     Int         @default(1000)
+  allowed        Boolean     @default(true)
+  userAgent      String?
+  createdAt      DateTime    @default(now())
+  updatedAt      DateTime    @updatedAt
+
+  jobs           ScrapeJob[]
+
+  @@index([domain])
+}
+
+model Proxy {
+  id          String      @id @default(cuid())
+  name        String?
+  url         String
+  status      String      @default("UNTESTED")
+  latencyMs   Int?
+  testedAt    DateTime?
+  createdAt   DateTime    @default(now())
+  updatedAt   DateTime    @updatedAt
+  jobs        ScrapeJob[]
+
+  @@index([createdAt])
+}

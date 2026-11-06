@@ -1,0 +1,40 @@
+﻿# Dependencies
+node_modules/
+
+# Build output
+dist/
+coverage/
+*.tsbuildinfo
+
+# Environment variables and secrets
+.env
+.env.*
+!.env.example
+
+# Runtime data
+storage/
+apify_storage/
+*.log
+logs/
+
+# Local databases
+*.db
+*.db-journal
+*.sqlite
+*.sqlite-journal
+
+# Test and tool caches
+.vitest/
+.cache/
+.eslintcache
+
+# IDE and OS files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Temporary files
+tmp/
+temp/
+*.tmp

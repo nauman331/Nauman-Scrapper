@@ -1,0 +1,14 @@
+node_modules
+dist
+.git
+.env
+scrape.db
+scrape.db-journal
+storage
+*.log
+coverage
+tests
+.agents
+.claude
+.cursor
+.devin
