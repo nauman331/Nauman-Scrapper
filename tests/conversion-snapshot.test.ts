@@ -6,6 +6,7 @@ import { conversionStorage } from '../src/generator/storage.js';
 import { staticValidator } from '../src/generator/validator/static-validator.js';
 import { zipPackager } from '../src/generator/packager/zip-packager.js';
 import { ConversionOptionsSchema } from '../src/generator/types.js';
+import { loadBoundedSnapshot } from '../src/generator/snapshot-loader.js';
 
 const job = { id: 'snapshot-job', targetUrl: 'https://example.com/', domain: 'example.com', name: 'Snapshot' };
 const page = { url: 'https://example.com/', rawData: { html: '<html><body><section><h1>Saved snapshot</h1></section></body></html>' } };
@@ -29,6 +30,25 @@ describe('Conversion snapshot loading and packaging gates', () => {
     expect(preview.pages).toHaveLength(205);
     expect(preview.pages[204].hasHtml).toBe(true);
     expect(preview.pages[204].htmlBytes).toBeGreaterThan(0);
+  });
+
+  it('rejects cumulative snapshot bytes before retaining the next result', async () => {
+    const budget = { pages: 1, bytes: 32 * 1024 * 1024 - 1 };
+    vi.spyOn(resultRepository, 'getResultsByJobId').mockResolvedValue({ items: [page], total: 1 } as never);
+    await expect(loadBoundedSnapshot(job.id, undefined, budget)).rejects.toThrow('safe project budget');
+    expect(budget.pages).toBe(1);
+  });
+
+  it('rejects combined page overflow before another database fetch', async () => {
+    const query = vi.spyOn(resultRepository, 'getResultsByJobId');
+    await expect(loadBoundedSnapshot(job.id, undefined, { pages: 500, bytes: 0 })).rejects.toThrow('500 pages');
+    expect(query).not.toHaveBeenCalled();
+  });
+
+  it('filters selected URLs at the repository boundary', async () => {
+    const query = vi.spyOn(resultRepository, 'getResultsByJobId').mockResolvedValue({ items: [page], total: 1 } as never);
+    await loadBoundedSnapshot(job.id, [page.url]);
+    expect(query).toHaveBeenCalledWith(job.id, expect.objectContaining({ urls: [page.url], limit: 25 }));
   });
 
   it('does not package missing saved HTML as placeholder content', async () => {

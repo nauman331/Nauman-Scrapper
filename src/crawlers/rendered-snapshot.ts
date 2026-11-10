@@ -31,8 +31,17 @@ export async function captureRenderedHtml(page: Page): Promise<string> {
       });
       return Array.from(sheet.cssRules, rule => {
         if (rule instanceof CSSImportRule) {
-          if (!rule.styleSheet) throw new Error('Unloaded stylesheet import');
-          let css = serializeSheet(rule.styleSheet, visited);
+          let css: string;
+          try {
+            if (!rule.styleSheet) throw new Error('Unloaded stylesheet import');
+            css = serializeSheet(rule.styleSheet, visited);
+          } catch {
+            // One cross-origin/unloaded import must not discard all readable
+            // rules in the parent sheet. Keep its conditions and absolute URL
+            // for the normal SSRF-validated asset resolver to handle later.
+            const href = new URL(rule.href, baseUrl).href.replace(/"/g, '%22');
+            return rule.cssText.replace(/@import\s+(?:url\([^)]*\)|"[^"]*"|'[^']*')/i, `@import url("${href}")`);
+          }
           if (rule.media.mediaText) css = `@media ${rule.media.mediaText}{${css}}`;
           if (rule.supportsText) css = `@supports (${rule.supportsText}){${css}}`;
           if (rule.layerName !== null) css = `@layer ${rule.layerName}{${css}}`;
@@ -82,6 +91,18 @@ export async function captureRenderedHtml(page: Page): Promise<string> {
       const copy = index === 0 ? clone : copies[index - 1];
       if (!copy || !(copy instanceof HTMLElement || copy instanceof SVGElement)) continue;
       const computed = getComputedStyle(original);
+      // Mark opaque full-screen logo/loading layers while computed geometry is
+      // available. Never delete during this loop: original/copy indices must align.
+      const bounds = original.getBoundingClientRect();
+      const loaderNames = [original.id, original.getAttribute('class') || '', original.getAttribute('aria-label') || ''].join(' ').replace(/([a-z])([A-Z])/g, '$1-$2');
+      const namedLoader = /(?:^|[\s_-])(?:pre-?loader|page-?loader|site-?loader|loading-?(?:screen|overlay|indicator|spinner)|loader|spinner|splash-?screen|animate-intro)(?:$|[\s_-])/i.test(loaderNames);
+      const protectsContent = original.matches('html,body,main,header,footer,nav,section,article') ||
+        !!original.querySelector('main,header,footer,nav,section,article,h1,h2,h3,video,audio,form');
+      const covering = computed.position === 'fixed' && bounds.width >= innerWidth * 0.9 && bounds.height >= innerHeight * 0.9;
+      const decorative = (original.textContent || '').trim().length < 120 &&
+        !original.querySelector('a,button,input,select,textarea,[role="button"],p') &&
+        (original.getAttribute('aria-hidden') === 'true' || !!original.querySelector('img,svg') || /loading|please wait/i.test(original.textContent || ''));
+      if (!protectsContent && (namedLoader || (covering && decorative))) copy.setAttribute('data-captured-loader', 'true');
       // Runtime CSS often uses opaque hashed classes. Mark fixed/sticky notice
       // containers using their text and controls so the static exporter can omit
       // them without depending on a particular consent vendor's class names.
@@ -113,6 +134,79 @@ export async function captureRenderedHtml(page: Page): Promise<string> {
       copy.style.setProperty('animation', 'none', 'important');
       copy.style.setProperty('transition', 'none', 'important');
       copy.setAttribute('data-captured-animation-state', '');
+    }
+    // Review the live source before scripts/custom controls are stripped. Runtime
+    // properties capture JS-driven playback that outerHTML alone cannot describe.
+    const videos = Array.from(document.querySelectorAll('video'));
+    const copiedVideos = Array.from(clone.querySelectorAll('video'));
+    for (let index = 0; index < videos.length; index++) {
+      const video = videos[index];
+      const copy = copiedVideos[index];
+      if (!copy) continue;
+      const computed = getComputedStyle(video);
+      const bounds = video.getBoundingClientRect();
+      const names = [video.id, video.className, video.parentElement?.id || '', video.parentElement?.className || ''].join(' ').replace(/([a-z])([A-Z])/g, '$1-$2');
+      const namedBackground = /(?:^|[\s_-])(?:background-video|video-background|bg-video|video-bg)(?:$|[\s_-])/i.test(names);
+      const parentBounds = video.parentElement?.getBoundingClientRect();
+      const coversParent = !!parentBounds && parentBounds.width > 0 && parentBounds.height > 0 && bounds.width >= parentBounds.width * 0.9 && bounds.height >= parentBounds.height * 0.9;
+      const decorative = !!video.closest('[aria-hidden="true"]') || computed.pointerEvents === 'none';
+      const behindContent = ['absolute', 'fixed'].includes(computed.position) && computed.objectFit === 'cover' && coversParent &&
+        !!video.parentElement?.querySelector('h1,h2,h3,p,a,button');
+      // Autoplay/muted/loop and "hero-video" alone also describe foreground reels.
+      const background = !video.controls && (namedBackground || decorative || behindContent);
+      copy.setAttribute('data-captured-video-review', JSON.stringify({
+        version: 1, role: background ? 'background' : 'foreground',
+        controls: video.controls, autoplay: video.autoplay,
+        playing: !video.paused && !video.ended && video.readyState >= 2,
+        muted: video.muted, loop: video.loop, playsInline: video.playsInline,
+        visible: video.checkVisibility({ checkOpacity: true, checkVisibilityCSS: true }) && bounds.width > 0 && bounds.height > 0,
+        objectFit: computed.objectFit,
+      }));
+      // React initializes muted from the serialized attribute, not the source
+      // property; preserve JS-assigned source state for foreground players too.
+      if (video.muted) copy.setAttribute('muted', ''); else copy.removeAttribute('muted');
+    }
+    // Canvas pixels live outside the DOM. Preserve the rendered bitmap without
+    // replacing SVG/HTML charts or requiring the source chart runtime to replay.
+    const canvases = Array.from(document.querySelectorAll('canvas'));
+    const copiedCanvases = Array.from(clone.querySelectorAll('canvas'));
+    for (let index = 0; index < canvases.length; index++) {
+      const canvas = canvases[index];
+      const copy = copiedCanvases[index];
+      if (!copy || !canvas.width || !canvas.height) continue;
+      try {
+        const image = document.createElement('img');
+        for (const attribute of Array.from(copy.attributes)) image.setAttribute(attribute.name, attribute.value);
+        image.src = canvas.toDataURL('image/png');
+        const bounds = canvas.getBoundingClientRect();
+        // CSS dimensions, not the high-DPI backing store, determine layout.
+        if (!copy.style.width && bounds.width) image.style.width = `${bounds.width}px`;
+        if (!copy.style.height && bounds.height) image.style.height = `${bounds.height}px`;
+        image.setAttribute('data-captured-canvas', '');
+        image.alt = canvas.getAttribute('aria-label') || canvas.textContent?.trim() || 'Captured chart';
+        copy.replaceWith(image);
+      } catch {
+        // Cross-origin/tainted canvases cannot be exported. Keep an explicit
+        // marker so validation never mistakes a blank canvas for success.
+        copy.setAttribute('data-captured-canvas-unavailable', 'true');
+      }
+    }
+    // Loaders have no place in exported page data, even when source CSS hides
+    // them only at an animation end state that a converter cannot reproduce.
+    const loaders = clone.querySelectorAll('[data-captured-loader="true"]');
+    loaders.forEach(element => element.remove());
+    if (loaders.length) {
+      for (const root of [clone, clone.querySelector('body')]) {
+        if (!root) continue;
+        for (const name of Array.from(root.classList)) {
+          if (/^(?:loading|is-loading|page-loading|preloading|preloader-active|no-scroll|noscroll|scroll-locked|overflow-hidden|overflow-y-hidden)$/i.test(name)) root.classList.remove(name);
+        }
+        root.style.removeProperty('position');
+        root.style.removeProperty('touch-action');
+        root.style.setProperty('overflow', 'auto', 'important');
+        root.style.setProperty('overflow-y', 'auto', 'important');
+        root.removeAttribute('aria-busy');
+      }
     }
     return '<!doctype html>\n' + clone.outerHTML;
   };

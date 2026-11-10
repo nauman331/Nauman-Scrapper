@@ -1,5 +1,6 @@
 import * as cheerio from 'cheerio';
 import postcss from 'postcss';
+import { removeSnapshotLoaders } from './loader-cleanup.js';
 
 const protectedContent = 'main, header, footer, nav, article, [role="main"], [role="navigation"], [role="banner"], [role="contentinfo"]';
 const vendor = /(?:^|[\s_-])(?:cybotcookiebotdialog(?:bodyunderlay)?|google_ads_iframe[^\s]*|onetrust|cookiebot|cookie-law-info|cookie-notice|cmplz-cookiebanner|didomi-host|iubenda-cs|qc-cmp|quantcast-consent|adsbygoogle|gpt-ad|ad-slot|ad-container)(?:$|[\s_-])/i;
@@ -8,8 +9,9 @@ const lockClass = /^(?:modal-open|popup-open|cookie-open|consent-open|no-scroll|
 
 /** Exact-only snapshot cleanup; never changes crawler capture or other exporters. */
 export function cleanupExactSnapshot(html: string, warnings: string[]) {
-  const $ = cheerio.load(html);
-  let removed = 0;
+  const loaders = removeSnapshotLoaders(html, warnings);
+  const $ = cheerio.load(loaders.html);
+  let removed = loaders.removed;
   const candidates = $('body *').toArray();
   for (const element of candidates) {
     if (!('attribs' in element) || ['script', 'style', 'template', 'svg', 'path'].includes(element.tagName)) continue;

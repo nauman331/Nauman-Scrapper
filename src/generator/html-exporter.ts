@@ -19,6 +19,9 @@ import { mapHtmlPageFiles, htmlAssetPath } from './html-project-structure.js';
 import { cssUrlPattern, unquoteCssUrl } from './assets/css-urls.js';
 import { convertDocumentToCoreCss } from './analyzer/core-css-converter.js';
 import { proxyService } from '../proxies/proxy.service.js';
+import { removeSnapshotLoaders } from './loader-cleanup.js';
+import { applyVideoPolicy } from './video-policy.js';
+import { splitFontDefinitions, resolveGoogleFontDefinitions } from './assets/font-resolver.js';
 
 // Pin the runtime to the compiler version; do not mix v3 utility semantics with v4.
 export const TAILWIND_BROWSER_URL = 'https://cdn.tailwindcss.com/3.4.17';
@@ -40,7 +43,7 @@ const dangerousUrl = (value: string) =>
 
 /** Removes executable source behavior, while retaining native details, anchors and controls. */
 export function sanitizeStandaloneHtml(html: string, warnings: string[], overlayGuard = false): string {
-  const $ = cheerio.load(html);
+  const $ = cheerio.load(applyVideoPolicy(removeSnapshotLoaders(html, warnings).html, warnings));
   // Source scripts are stripped below, so their dismiss/consent handlers cannot
   // work. Omit transient UI rather than shipping a permanently blocking overlay.
   const transientName =
@@ -406,16 +409,23 @@ export async function exportStandaloneHtml(input: {
       )
     ) {
       throw new Error(
-        'A required source stylesheet could not be loaded. Re-scrape with PLAYWRIGHT to capture browser-loaded CSS before exporting Tailwind.'
+        'A required source stylesheet could not be loaded: ' + resolved.missingAssets.filter((missing) =>
+          cssSources.some(source => source.asset && (missing === source.asset.originalUrl || missing.startsWith(source.asset.originalUrl + ' (')))
+        ).join('; ') + '. Re-scrape with PLAYWRIGHT after verifying the stylesheet loads in the source page. An existing snapshot cannot recover CSS that was never captured.'
       );
     }
+    const fontDefinitions = splitFontDefinitions(resolved.consolidatedCss);
+    const googleFonts = fontDefinitions.fontCss
+      ? await resolveGoogleFontDefinitions(conversionId, fontDefinitions.fontCss, proxyUrl)
+      : { fontCss: fontDefinitions.fontCss, downloadedAssets: [] };
+    resolved.downloadedAssets.push(...googleFonts.downloadedAssets);
     const assetMap = new Map<string, string>();
     for (const asset of resolved.downloadedAssets) {
       // Stylesheet content is already consolidated for Tailwind/residual output.
       // Raw downloaded copies are temporary inputs, not runtime project assets.
-      if (asset.isStylesheet || (!isCoreCss && asset.isFont)) continue;
+      if (asset.isStylesheet) continue;
       const local = asset.publicUrl.replace(/^\//, '');
-      if (!/^(?:images|fonts|icons|css|animations)\/[a-zA-Z0-9._-]+$/.test(local))
+      if (!/^(?:images|fonts|icons|css|animations|videos|audio)\/[a-zA-Z0-9._-]+$/.test(local))
         throw new Error('Unsafe downloaded asset path.');
       const target = htmlAssetPath(asset);
       assetMap.set(asset.originalUrl, target);
@@ -453,7 +463,7 @@ export async function exportStandaloneHtml(input: {
           : `url("${localUrl(unquoteCssUrl(raw), fromFile).replace(/"/g, '%22')}")`
       );
     for (const asset of resolved.downloadedAssets) {
-      if (asset.isStylesheet || (!isCoreCss && asset.isFont)) continue;
+      if (asset.isStylesheet) continue;
       const target = assetMap.get(asset.publicUrl)!;
       if (copied.has(target)) continue;
       let buffer = await fs.readFile(
@@ -574,7 +584,9 @@ export async function exportStandaloneHtml(input: {
       if (srcset) image.attr('srcset', srcset);
       source.after(image);
     });
-    const recoveredSourceCss = sanitizeGeneratedCss(resolved.consolidatedCss, {
+    const recoveredSourceCss = sanitizeGeneratedCss(isCoreCss
+      ? googleFonts.fontCss + '\n' + fontDefinitions.utilityCss
+      : resolved.consolidatedCss, {
       strategy: isCoreCss ? 'original' : 'tailwind',
     });
     if (recoveredSourceCss !== resolved.consolidatedCss)
@@ -631,7 +643,13 @@ export async function exportStandaloneHtml(input: {
       });
       prepared(element).attr('class', names.map((name) => sourceNames.get(name)).join(' '));
     });
-    const namespacedCss = postcss.parse(rewriteCss(sourceCss, output.path));
+    const fontCssPath = index === 0 ? 'assets/fonts/fonts.css' : `assets/fonts/fonts-${index + 1}.css`;
+    const preservedFonts = safeCss(googleFonts.fontCss, warnings);
+    if (preservedFonts.trim()) {
+      await conversionStorage.writeFileSafe(conversionId, fontCssPath, rewriteCss(preservedFonts, fontCssPath));
+      totalFiles++;
+    }
+    const namespacedCss = postcss.parse(rewriteCss(splitFontDefinitions(sourceCss).utilityCss, output.path));
     namespacedCss.walkRules((rule) => {
       if (rule.parent?.type === 'atrule' && /keyframes$/i.test(rule.parent.name)) return;
       try {
@@ -657,9 +675,9 @@ export async function exportStandaloneHtml(input: {
     input.stage?.('compile-tailwind', `Preparing CDN utilities and isolated preview for ${page.url}`);
     // Private, script-free dashboard preview; never included in the ZIP.
     const compiled = await postcss([
-      tailwindcss({ content: [], safelist: migrated.utilities || [], corePlugins: { preflight: false } }),
+      tailwindcss({ content: [{ raw: '', extension: 'html' }], safelist: migrated.utilities || [], corePlugins: { preflight: false } }),
     ]).process('@tailwind utilities;', { from: undefined });
-    tailwindPreviewCss[output.path] = compiled.css;
+    tailwindPreviewCss[output.path] = rewriteCss(preservedFonts, output.path) + '\n' + compiled.css;
     if (discovered.some((asset) => asset.type === 'stylesheet') && !sourceCss.trim())
       throw new Error(
         'No original stylesheets could be loaded. Export stopped; check stylesheet download errors and re-scrape the page.'
@@ -679,6 +697,9 @@ export async function exportStandaloneHtml(input: {
       if (classes.length) final(element).attr('class', classes.join(' '));
       else final(element).removeAttr('class');
     });
+    if (preservedFonts.trim()) {
+      final('head').append(`<link rel="stylesheet" data-cloned-fonts href="${relativeOutputUrl(output.path, fontCssPath)}">`);
+    }
     final('head').append(
       `<script src="${TAILWIND_BROWSER_URL}"></script><script>${TAILWIND_BROWSER_CONFIG}</script>`
     );

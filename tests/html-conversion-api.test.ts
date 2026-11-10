@@ -209,7 +209,7 @@ describe('HTML conversion API', () => {
     expect(response.statusCode).toBe(200);
     expect(response.json().data.totalPages).toBe(250);
     expect(response.json().data.pages[249].url).toBe('https://site.test/page-249');
-    expect(spy).toHaveBeenCalledWith('job', { limit: 200, offset: 200 });
+    expect(spy).toHaveBeenCalledWith('job', expect.objectContaining({ limit: 25, offset: 200 }));
   });
   it('reuses job inventory preview at both prefix aliases', async () => {
     expect((await app.inject('/api/jobs/job/convert/preview')).json().data.jobId).toBe('job');

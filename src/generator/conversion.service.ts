@@ -1,6 +1,8 @@
 import crypto from 'node:crypto';
 import { jobRepository } from '../persistence/repositories/job.repository.js';
-import { resultRepository } from '../persistence/repositories/result.repository.js';
+import { loadBoundedSnapshot } from './snapshot-loader.js';
+import { removeSnapshotLoaders } from './loader-cleanup.js';
+import { applyVideoPolicy } from './video-policy.js';
 import { conversionStorage } from './storage.js';
 import { buildPageInventory, type RawScrapePageItem } from './inventory/page-inventory.js';
 import { domAnalyzer } from './analyzer/dom-analyzer.js';
@@ -76,15 +78,8 @@ export class ConversionService {
     return buildPageInventory(jobId, job.targetUrl, job.domain, rawPages);
   }
 
-  private async loadScrapeResults(jobId: string) {
-    const first = await resultRepository.getResultsByJobId(jobId, { limit: 200, offset: 0 });
-    const items = [...first.items];
-    while (items.length < first.total) {
-      const batch = await resultRepository.getResultsByJobId(jobId, { limit: 200, offset: items.length });
-      if (!batch.items.length) break;
-      items.push(...batch.items);
-    }
-    return { ...first, items };
+  private async loadScrapeResults(jobId: string, urls?: string[]) {
+    return loadBoundedSnapshot(jobId, urls);
   }
 
   async startConversion(jobId: string, options: ConversionOptions): Promise<ConversionRecord> {
@@ -178,7 +173,7 @@ export class ConversionService {
 
       // 2. Stage: load-scrape-snapshot
       this.updateStage(record, 'load-scrape-snapshot', 'running', 'Loading scraped HTML documents');
-      const results = await this.loadScrapeResults(job!.id);
+      const results = await this.loadScrapeResults(job!.id, options.pages);
       if (results.items.length === 0) {
         throw new Error('No scraped page results exist for this job. Please run a scrape first.');
       }
@@ -210,6 +205,12 @@ export class ConversionService {
         throw new Error(`Cannot convert ${missingHtml.length} page(s) without saved HTML. Scrape again with extractHtml enabled: ${missingHtml.map((page) => page.url).join(', ')}`);
       }
 
+      const videoWarnings: string[] = [];
+      for (const page of rawPages) {
+        const warnings: string[] = [];
+        page.rawData = { ...page.rawData, html: applyVideoPolicy(removeSnapshotLoaders(page.rawData!.html!, []).html, warnings) };
+        videoWarnings.push(...warnings.map(warning => `${page.url}: ${warning}`));
+      }
       const inventory = buildPageInventory(job!.id, job!.targetUrl, job!.domain, rawPages);
       record.inventory = inventory;
       this.updateStage(
@@ -473,6 +474,7 @@ ${generatedCss}
           validationReport.errors.push(`Generated CSS compilation failed: ${error instanceof Error ? error.message : String(error)}`);
         }
       }
+      validationReport.warnings.push(...videoWarnings);
       record.validationReport = validationReport;
       this.updateStage(
         record,

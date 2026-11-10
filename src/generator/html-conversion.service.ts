@@ -4,7 +4,7 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import * as cheerio from 'cheerio';
 import { jobRepository } from '../persistence/repositories/job.repository.js';
-import { resultRepository } from '../persistence/repositories/result.repository.js';
+import { loadBoundedSnapshot, type SnapshotBudget } from './snapshot-loader.js';
 import { conversionStorage } from './storage.js';
 import { zipPackager } from './packager/zip-packager.js';
 import { exportStandaloneHtml, TAILWIND_BROWSER_URL, TAILWIND_BROWSER_CONFIG } from './html-exporter.js';
@@ -22,15 +22,8 @@ const STAGES: Array<[HtmlStageId, string]> = [
 export class HtmlConversionService {
   private records = new Map<string, HtmlConversionRecord>();
   getConversion(id: string): HtmlConversionRecord | null { return this.records.get(id) || null; }
-  private async loadSnapshot(jobId: string) {
-    const first = await resultRepository.getResultsByJobId(jobId, { limit: 200, offset: 0 });
-    const items = [...first.items];
-    while (items.length < Math.min(first.total, 500)) {
-      const next = await resultRepository.getResultsByJobId(jobId, { limit: Math.min(200, 500 - items.length), offset: items.length });
-      if (!next.items.length) break;
-      items.push(...next.items);
-    }
-    return { items, total: first.total };
+  private async loadSnapshot(jobId: string, urls?: string[], budget?: SnapshotBudget) {
+    return loadBoundedSnapshot(jobId, urls, budget);
   }
   async getJobPreview(jobId: string) {
     const job = await jobRepository.getJobById(jobId);
@@ -83,14 +76,15 @@ export class HtmlConversionService {
       this.stage(record, 'load-scrape-snapshot', 'Loading captured results with pagination (up to 500 pages)');
       // Only snapshot orchestration changes: every page was captured by the
       // existing single-page crawler and goes through the unchanged exporter.
-      const snapshot = await this.loadSnapshot(job.id);
+      const budget: SnapshotBudget = { pages: 0, bytes: 0 };
+      const snapshot = await this.loadSnapshot(job.id, record.options.pages, budget);
       for (const id of new Set(record.options.snapshotJobIds || [])) {
         if (id === job.id) continue;
         const additionalJob = await jobRepository.getJobById(id);
         if (!additionalJob || new URL(additionalJob.targetUrl).origin !== new URL(job.targetUrl).origin) {
           throw new Error('All selected scrape snapshots must exist and belong to the same website.');
         }
-        const additional = await this.loadSnapshot(id);
+        const additional = await this.loadSnapshot(id, record.options.pages, budget);
         snapshot.items.push(...additional.items);
         snapshot.total += additional.total;
       }
@@ -117,7 +111,7 @@ export class HtmlConversionService {
           (!$(element).attr('src') && $(element).text().trim() === TAILWIND_BROWSER_CONFIG)
         ));
         if ($('html').length !== 1 || $('head').length !== 1 || $('body').length !== 1 || unsafeScripts.length || $('iframe, object, embed, form:not([inert])').length) errors.push(`Unsafe or incomplete document: ${page.path}`);
-        if (!isCore && ($('[style], style, link[rel~="stylesheet"]').length || $('script[src]').length !== 1 || $('script[src]').attr('src') !== TAILWIND_BROWSER_URL)) errors.push(`Invalid Tailwind CDN document: ${page.path}`);
+        if (!isCore && ($('[style], style, link[rel~="stylesheet"]:not([data-cloned-fonts])').length || $('script[src]').length !== 1 || $('script[src]').attr('src') !== TAILWIND_BROWSER_URL)) errors.push(`Invalid Tailwind CDN document: ${page.path}`);
         if (record.options.cssStrategy === 'core') {
           if ($('[style], style').length) errors.push(`Inline CSS remains in Core CSS document: ${page.path}`);
           if (!css!.startsWith('/* it is converted from inline CSS to external CSS */')) errors.push(`Missing Core CSS conversion comment: ${page.cssPath}`);

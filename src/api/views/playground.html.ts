@@ -540,6 +540,17 @@ export function renderPlaygroundHtml(): string {
     .proxy-security-note { margin-top: 24px; padding-top: 16px; border-top: 1px solid var(--border); color: var(--text-muted); font-size: 11px; line-height: 1.6; }
     .proxy-saved-card { margin-top: 20px; padding: 0; overflow: hidden; }
     .proxy-saved-head { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 21px 24px; border-bottom: 1px solid var(--border); }
+    .proxy-test-toolbar { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 14px; margin-top: 20px; }
+    .proxy-test-badges { display: flex; flex-wrap: wrap; gap: 8px; }
+    .proxy-test-badge { display: inline-flex; align-items: center; gap: 8px; padding: 8px 12px; border: 1px solid var(--border); border-radius: 999px; font-size: 12px; font-weight: 600; }
+    .proxy-test-badge strong { font-size: 14px; font-variant-numeric: tabular-nums; }
+    .proxy-test-success { color: #34d399; background: rgba(16,185,129,.1); border-color: rgba(16,185,129,.25); }
+    .proxy-test-failed { color: #fb7185; background: rgba(244,63,94,.1); border-color: rgba(244,63,94,.25); }
+    .proxy-test-total { color: #93c5fd; background: rgba(37,99,235,.12); border-color: rgba(59,130,246,.22); }
+    .proxy-test-button { width: auto; min-height: 40px; padding: 9px 16px; box-shadow: none; }
+    .proxy-test-progress { margin-top: 10px; color: var(--text-muted); font-size: 12px; min-height: 18px; }
+    .proxy-test-button:disabled, .proxy-btn:disabled { opacity: .55; cursor: not-allowed; }
+    .proxy-test-button:focus-visible, .proxy-btn:focus-visible { outline: 2px solid var(--border-focus); outline-offset: 3px; }
     .proxy-count { padding: 5px 9px; border-radius: 999px; color: #93c5fd; background: rgba(37,99,235,.12); border: 1px solid rgba(59,130,246,.22); font-size: 11px; font-weight: 700; }
     .proxy-table-head { display: grid; grid-template-columns: minmax(130px, .8fr) minmax(230px, 1.55fr) 120px 100px 170px 150px; gap: 14px; padding: 10px 24px; background: rgba(255,255,255,.018); border-bottom: 1px solid var(--border); color: #64748b; font-size: 10px; font-weight: 700; letter-spacing: .55px; text-transform: uppercase; }
     .proxy-list { display: flex; flex-direction: column; }
@@ -1138,6 +1149,15 @@ contact us</textarea><div class="field-hint" id="specificKeywordsHint">One norma
       <div class="proxy-page-intro">
         <h1 class="proxy-page-title" id="proxyPageTitle">Proxy management</h1>
         <p class="proxy-page-copy">Add and monitor the proxy servers available to your scraping jobs. Test connectivity before assigning a proxy from the request builder.</p>
+        <div class="proxy-test-toolbar">
+          <div class="proxy-test-badges" role="group" aria-label="Proxy test results">
+            <span class="proxy-test-badge proxy-test-success">Succeeded <strong id="proxySucceededCount">0</strong></span>
+            <span class="proxy-test-badge proxy-test-failed">Failed <strong id="proxyFailedCount">0</strong></span>
+            <span class="proxy-test-badge proxy-test-total">Total <strong id="proxyTestTotalCount">0</strong></span>
+          </div>
+          <button id="btnTestAllProxies" type="button" class="btn-submit proxy-test-button" onclick="testAllProxies()" aria-describedby="proxyTestProgress" disabled>Test all proxies</button>
+        </div>
+        <p id="proxyTestProgress" class="proxy-test-progress" role="status" aria-live="polite">Add proxies to test their connectivity.</p>
       </div>
 
       <div class="proxy-overview">
@@ -2223,6 +2243,13 @@ contact us</textarea><div class="field-hint" id="specificKeywordsHint">One norma
     window.addEventListener('DOMContentLoaded', () => showView(dashboardViewFromPath(), false));
     function handleProxyToggle(){ document.getElementById('proxySelect').disabled=!document.getElementById('enableProxy').checked; updateCodeSnippet(); }
     async function proxyRequest(url, options={}) { const response=await fetch(url,{...options,headers:{...proxyHeaders,...(options.headers||{})}}); if(response.status===204)return null; const body=await response.json(); if(!response.ok)throw new Error(body.error?.message||'Proxy request failed'); return body.data; }
+    let proxyTestsRunning = false;
+    let savedProxyCount = 0;
+    function updateProxyTestBadges(succeeded, failed, total) {
+      document.getElementById('proxySucceededCount').innerText = String(succeeded);
+      document.getElementById('proxyFailedCount').innerText = String(failed);
+      document.getElementById('proxyTestTotalCount').innerText = String(total);
+    }
     async function loadProxies() {
       try {
         const items = await proxyRequest('/api/v1/proxies');
@@ -2236,6 +2263,12 @@ contact us</textarea><div class="field-hint" id="specificKeywordsHint">One norma
         }
         handleHtmlProxyToggle();
 
+        savedProxyCount = items.length;
+        document.getElementById('btnTestAllProxies').disabled = proxyTestsRunning || items.length === 0;
+        if (!proxyTestsRunning) {
+          updateProxyTestBadges(items.filter(proxy => proxy.status === 'WORKING').length, items.filter(proxy => proxy.status === 'NOT_WORKING').length, items.length);
+          document.getElementById('proxyTestProgress').innerText = items.length ? 'Latest saved test results. Untested proxies are included in the total only.' : 'Add proxies to test their connectivity.';
+        }
         document.getElementById('proxyTotalCount').innerText = String(items.length);
         document.getElementById('proxyCountBadge').innerText = items.length + (items.length === 1 ? ' proxy' : ' proxies');
         document.getElementById('proxyList').innerHTML = items.length
@@ -2257,6 +2290,7 @@ contact us</textarea><div class="field-hint" id="specificKeywordsHint">One norma
 
         document.querySelectorAll('[data-test]').forEach(button => button.onclick = () => testProxy(button.dataset.test));
         document.querySelectorAll('[data-delete]').forEach(button => button.onclick = () => deleteProxy(button.dataset.delete));
+        document.querySelectorAll('[data-test], [data-delete]').forEach(button => button.disabled = proxyTestsRunning);
       } catch (error) {
         document.getElementById('proxyMessage').innerText = error.message;
         document.getElementById('htmlProxyHint').textContent = 'Could not refresh saved proxies: ' + error.message;
@@ -2295,6 +2329,53 @@ contact us</textarea><div class="field-hint" id="specificKeywordsHint">One norma
         await loadProxies();
       } catch (error) { message.textContent = error.message; }
       finally { button.disabled = false; input.readOnly = false; }
+    }
+    async function testAllProxies() {
+      const button = document.getElementById('btnTestAllProxies');
+      const progress = document.getElementById('proxyTestProgress');
+      if (proxyTestsRunning || button.disabled) return;
+      proxyTestsRunning = true;
+      button.disabled = true;
+      button.innerText = 'Testing proxies…';
+      document.querySelectorAll('[data-test], [data-delete]').forEach(action => action.disabled = true);
+      progress.innerText = 'Loading proxies to test…';
+      try {
+        const items = await proxyRequest('/api/v1/proxies');
+        let succeeded = 0;
+        let failed = 0;
+        let requestErrors = 0;
+        let nextIndex = 0;
+        updateProxyTestBadges(0, 0, items.length);
+        progress.innerText = 'Testing 0 of ' + items.length + ' proxies…';
+        async function testNext() {
+          while (nextIndex < items.length) {
+            const proxy = items[nextIndex++];
+            try {
+              const result = await proxyRequest('/api/v1/proxies/' + encodeURIComponent(proxy.id) + '/test', { method: 'POST', body: JSON.stringify({}) });
+              if (result?.status === 'WORKING') succeeded++;
+              else failed++;
+            } catch {
+              failed++;
+              requestErrors++;
+            }
+            updateProxyTestBadges(succeeded, failed, items.length);
+            progress.innerText = 'Tested ' + (succeeded + failed) + ' of ' + items.length + ' proxies…';
+          }
+        }
+        await Promise.all(Array.from({ length: Math.min(5, items.length) }, () => testNext()));
+        await loadProxies();
+        updateProxyTestBadges(succeeded, failed, items.length);
+        progress.innerText = items.length
+          ? 'Test complete: ' + succeeded + ' succeeded, ' + failed + ' failed, ' + items.length + ' total.' + (requestErrors ? ' ' + requestErrors + ' test requests could not complete; included as failed.' : '')
+          : 'No proxies saved. Add proxies to test their connectivity.';
+      } catch (error) {
+        progress.innerText = 'Could not test proxies: ' + error.message;
+      } finally {
+        proxyTestsRunning = false;
+        button.disabled = savedProxyCount === 0;
+        button.innerText = 'Test all proxies';
+        document.querySelectorAll('[data-test], [data-delete]').forEach(action => action.disabled = false);
+      }
     }
     async function testProxy(id){ document.getElementById('proxyMessage').innerText='Testing proxy…'; try{await proxyRequest('/api/v1/proxies/'+id+'/test',{method:'POST',body:JSON.stringify({})}); document.getElementById('proxyMessage').innerText='Test complete.'; await loadProxies();}catch(e){document.getElementById('proxyMessage').innerText=e.message;} }
     async function deleteProxy(id){ if(!confirm('Delete this proxy?'))return; try{await proxyRequest('/api/v1/proxies/'+id,{method:'DELETE',body:JSON.stringify({})}); await loadProxies();}catch(e){document.getElementById('proxyMessage').innerText=e.message;} }

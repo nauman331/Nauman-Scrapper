@@ -111,11 +111,13 @@ export class ResultRepository {
       limit?: number;
       offset?: number;
       validationPassed?: boolean;
+      urls?: string[];
     } = {}
   ) {
     const limit = Math.min(options.limit ?? 50, 200);
     const offset = options.offset ?? 0;
-    const where: { jobId: string; validationPassed?: boolean } = { jobId };
+    const where: { jobId: string; validationPassed?: boolean; url?: { in: string[] } } = { jobId };
+    if (options.urls?.length) where.url = { in: options.urls };
 
     if (typeof options.validationPassed === 'boolean') {
       where.validationPassed = options.validationPassed;

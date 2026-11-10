@@ -14,13 +14,14 @@ import { cssUrlPattern, unquoteCssUrl } from './assets/css-urls.js';
 import { format } from 'prettier';
 import { HtmlSvgProcessor } from './assets/svg-processor.js';
 import { cleanupExactSnapshot } from './exact-cleanup.js';
+import { applyVideoPolicy } from './video-policy.js';
 
 const URL_ATTRIBUTES = new Set(['href', 'src', 'poster', 'xlink:href', 'background', 'data-src', 'data-lazy-src', 'data-original']);
 const dangerousUrl = (value: string) => /^(?:javascript|vbscript|file|blob):/i.test(value.replace(/[\u0000-\u0020]/g, '')) || /^data:(?!image\/(?:png|gif|jpeg|webp|avif|bmp|x-icon)(?:;|,))/i.test(value.trim());
 
 /** Preserve presentation hooks, but never source executable behavior. */
 export function sanitizeExactHtml(html: string, warnings: string[]): string {
-  const $ = cheerio.load(html);
+  const $ = cheerio.load(applyVideoPolicy(html, warnings));
   if ($('script, iframe, object, embed, applet').length) warnings.push('Source scripts and embedded executable documents were removed; script-driven features are unavailable.');
   $('script, iframe, object, embed, applet, base').remove();
   $('meta[http-equiv]').each((_, element) => {

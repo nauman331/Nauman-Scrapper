@@ -5,6 +5,118 @@ import postcssNesting from 'postcss-nesting';
 
 type LoadedDocument = ReturnType<typeof cheerio.load>;
 
+/** Budgets cover the whole conversion, including all pages and inline CSS. */
+export interface TailwindConversionLimits {
+  htmlBytes: number;
+  cssBytes: number;
+  /** Maximum concurrently retained winners; strict mode releases each element's cascade. */
+  expandedCandidates: number;
+  /** Separate CPU-work bound for declaration/element visits. */
+  candidateVisits: number;
+  candidatesPerElement: number;
+  conditionsPerGroup: number;
+  conditionsPerCandidate: number;
+  utilityCount: number;
+  utilityBytes: number;
+  classLength: number;
+  elementClassLength: number;
+  generatedClassBytes: number;
+  warningCount: number;
+  warningBytes: number;
+}
+const DEFAULT_LIMITS: TailwindConversionLimits = {
+  htmlBytes: 16 * 1024 * 1024,
+  cssBytes: 4 * 1024 * 1024,
+  expandedCandidates: 250_000,
+  candidateVisits: 5_000_000,
+  candidatesPerElement: 2048,
+  conditionsPerGroup: 64,
+  conditionsPerCandidate: 32,
+  utilityCount: 25_000,
+  utilityBytes: 4 * 1024 * 1024,
+  classLength: 8192,
+  elementClassLength: 64 * 1024,
+  generatedClassBytes: 32 * 1024 * 1024,
+  warningCount: 1000,
+  warningBytes: 1024 * 1024,
+};
+
+class TailwindBudgetError extends Error {
+  constructor(name: string, limit: number) {
+    super(`Tailwind conversion exceeded ${name} budget (${limit}). Use Core CSS export or export fewer pages / a smaller stylesheet.`);
+    this.name = 'TailwindBudgetError';
+  }
+}
+function createBudget(overrides: Partial<TailwindConversionLimits> = {}) {
+  const limits = { ...DEFAULT_LIMITS, ...overrides };
+  for (const [name, value] of Object.entries(limits)) {
+    if (!Number.isSafeInteger(value) || value < 1)
+      throw new Error(`Invalid Tailwind conversion budget ${name}; expected a positive safe integer.`);
+  }
+  const check = (name: keyof TailwindConversionLimits, value: number) => {
+    if (value > limits[name]) throw new TailwindBudgetError(name, limits[name]);
+  };
+  let expanded = 0;
+  let visits = 0;
+  let utilityBytes = 0;
+  let generatedBytes = 0;
+  let warningBytes = 0;
+  const utilities = new Set<string>();
+  const warnings: TailwindConversionWarning[] = [];
+  const warningKeys = new Set<string>();
+  const classSets = new WeakMap<object, Set<string>>();
+  const classLengths = new WeakMap<object, number>();
+  return {
+    check,
+    utilities,
+    warnings,
+    expand(count = 1) { check('expandedCandidates', expanded += count); },
+    release(count: number) { expanded -= count; },
+    visit(count = 1) { check('candidateVisits', visits += count); },
+    warn(message: string, selector?: string, property?: string) {
+      const key = JSON.stringify([message, selector, property]);
+      if (warningKeys.has(key)) return;
+      check('warningCount', warnings.length + 1);
+      check('warningBytes', warningBytes += Buffer.byteLength(key));
+      warningKeys.add(key);
+      warnings.push({ message, selector, property });
+    },
+    addClass($: LoadedDocument, element: unknown, className: string) {
+      check('classLength', className.length);
+      if (!utilities.has(className)) {
+        check('utilityCount', utilities.size + 1);
+        check('utilityBytes', utilityBytes += Buffer.byteLength(className));
+        utilities.add(className);
+      }
+      const node = element as object;
+      let classes = classSets.get(node);
+      if (!classes) {
+        const current = $(element as never).attr('class') || '';
+        check('elementClassLength', current.length);
+        classes = new Set(current.split(/\s+/).filter(Boolean));
+        classSets.set(node, classes);
+        classLengths.set(node, [...classes].join(' ').length);
+      }
+      if (classes.has(className)) return;
+      const length = classLengths.get(node)! + className.length + (classes.size ? 1 : 0);
+      check('elementClassLength', length);
+      check('generatedClassBytes', generatedBytes += Buffer.byteLength(className) + 1);
+      classes.add(className);
+      classLengths.set(node, length);
+    },
+    flushClasses($: LoadedDocument, element: unknown) {
+      const classes = classSets.get(element as object);
+      if (classes) $(element as never).attr('class', [...classes].join(' '));
+      classSets.delete(element as object);
+      classLengths.delete(element as object);
+    },
+  };
+}
+type ConversionBudget = ReturnType<typeof createBudget>;
+function rethrowBudget(error: unknown): void {
+  if (error instanceof TailwindBudgetError) throw error;
+}
+
 export interface TailwindDocumentInput {
   id: string;
   html: string;
@@ -280,7 +392,10 @@ function strictLonghands(property: string, value: string): Array<[string, string
           .filter((token) => /^(repeat|no-repeat|repeat-x|repeat-y|space|round)$/.test(token))
           .join(' ') || 'repeat';
       const attachment = tokens.find((token) => /^(scroll|fixed|local)$/.test(token)) || 'scroll';
+      // CSSOM folds background-clip:text into the shorthand as a trailing
+      // `text` token. It is a clipping value, never a background color.
       const boxes = tokens.filter((token) => /^(border-box|padding-box|content-box)$/.test(token));
+      const textClip = tokens.includes('text');
       const position =
         tokens
           .filter((token) =>
@@ -292,6 +407,7 @@ function strictLonghands(property: string, value: string): Array<[string, string
         ...repeat.split(' '),
         attachment,
         ...boxes,
+        ...(textClip ? ['text'] : []),
         ...postcss.list.space(position),
       ]);
       const color = tokens.filter((token) => !known.has(token)).join(' ') || 'transparent';
@@ -301,7 +417,7 @@ function strictLonghands(property: string, value: string): Array<[string, string
         repeat,
         attachment,
         origin: boxes[0] || 'padding-box',
-        clip: boxes[1] || boxes[0] || 'border-box',
+        clip: textClip ? 'text' : boxes[1] || boxes[0] || 'border-box',
         position,
         size:
           sizeTokens.filter((token) => !/^(border-box|padding-box|content-box)$/.test(token)).join(' ') ||
@@ -438,7 +554,8 @@ function conditionVariant(condition: StrictCondition): string {
  */
 function convertStrictTailwind(
   documents: readonly TailwindDocumentInput[],
-  css: string
+  css: string,
+  budget: ConversionBudget
 ): TailwindConversionResult {
   // Resolve native nesting before matching selectors against the captured DOM.
   const root = postcss([postcssNesting()])
@@ -470,8 +587,7 @@ function convertStrictTailwind(
       if (rule.nodes) layerPaths.set(rule, layer);
     }
   });
-  const warnings: TailwindConversionWarning[] = [];
-  const utilities = new Set<string>();
+  const { warnings, utilities } = budget;
   const stats = {
     declarationsSeen: 0,
     declarationsConverted: 0,
@@ -482,17 +598,112 @@ function convertStrictTailwind(
   const loaded = documents.map((document) => ({
     document,
     $: cheerio.load(document.html),
-    candidates: new Map<object, StrictCandidate[]>(),
+    // Selector matching finishes before any DOM mutation. Retain only numeric
+    // references to shared recipes, never the declaration × element graph.
+    assignments: new Map<object, number[]>(),
   }));
-  const converted = new Set<Declaration>();
-  const inlineDeclarations = new Set<Declaration>();
-  let order = 0;
-  const warn = (message: string, selector?: string, property?: string) => {
-    warnings.push({ message, selector, property });
+  // Custom properties are observable through var() (including fallbacks and
+  // transitive definitions) and CSS condition queries. Scripts are not part of
+  // strict paint conversion. Prune only definitions outside that dependency
+  // closure, never a framework-name blacklist. Scan all definition dependencies;
+  // roots are matched paint declarations, keyframes, queries and inline values.
+  // Unmatched static rules cannot observe values in this captured document.
+  const variableDependencies = new Map<string, Set<string>>();
+  const liveVariables = new Set<string>();
+  let uncertainVariableSyntax = false;
+  const unquotedValue = (value: string): string => {
+    let result = '';
+    for (let i = 0; i < value.length; i++) {
+      const char = value[i];
+      if (char === '/' && value[i + 1] === '*') {
+        const end = value.indexOf('*/', i + 2);
+        if (end === -1) { uncertainVariableSyntax = true; break; }
+        i = end + 1;
+      } else if (char === '"' || char === "'") {
+        const quote = char;
+        let closed = false;
+        while (++i < value.length) {
+          if (value[i] === '\\') i++;
+          else if (value[i] === quote) { closed = true; break; }
+        }
+        if (!closed) uncertainVariableSyntax = true;
+        result += ' ';
+      } else {
+        // Escaped identifiers need CSS token decoding. Disable pruning rather
+        // than infer that an escaped var()/custom-property name is unused.
+        if (char === '\\') uncertainVariableSyntax = true;
+        result += char;
+      }
+    }
+    return result;
   };
-  const add = (
-    documentIndex: number,
-    element: object,
+  const variableReferences = (value: string): Set<string> => {
+    const text = unquotedValue(value);
+    const refs = new Set<string>();
+    for (const match of text.matchAll(/\bvar\s*\(\s*(--[\w-]+)/gi)) refs.add(match[1]);
+    // Non-ASCII identifiers are valid CSS, but not covered by this compact lexer.
+    if (/[^\x00-\x7f]/.test(text)) uncertainVariableSyntax = true;
+    return refs;
+  };
+  const inspectVariables = (declaration: Declaration, observed = false) => {
+    const refs = variableReferences(declaration.value);
+    if (declaration.prop.startsWith('--')) {
+      if (!/^--[\w-]+$/.test(declaration.prop)) uncertainVariableSyntax = true;
+      const dependencies = variableDependencies.get(declaration.prop) || new Set<string>();
+      refs.forEach((ref) => dependencies.add(ref));
+      variableDependencies.set(declaration.prop, dependencies);
+    } else if (observed) refs.forEach((ref) => liveVariables.add(ref));
+  };
+  root.walkDecls((declaration) => {
+    let animated = false;
+    for (let parent: postcss.Node | undefined = declaration.parent; parent; parent = parent.parent)
+      if (parent.type === 'atrule' && /keyframes$/i.test((parent as AtRule).name)) animated = true;
+    inspectVariables(declaration, animated);
+  });
+  root.walkAtRules((rule) => {
+    const text = unquotedValue(rule.params);
+    // Registration alone does not observe a variable's value. Preserve
+    // condition-query observations even when their context is unsupported.
+    if (rule.name.toLowerCase() !== 'property')
+      for (const match of text.matchAll(/--[\w-]+/g)) liveVariables.add(match[0]);
+  });
+  loaded.forEach(({ $ }) => {
+    $('[style]').each((_, element) => {
+      try {
+        postcss.parse(`x{${$(element).attr('style') || ''}}`).walkDecls((declaration) => { inspectVariables(declaration); });
+      } catch {
+        uncertainVariableSyntax = true;
+      }
+    });
+  });
+  // Query/keyframe observations are global. Paint references can only consume
+  // definitions on their own element or ancestors (including pseudo-elements).
+  const globallyObservedVariables = new Set(liveVariables);
+  const paintVariables = new Map<object, Set<string>>();
+  const addPaintReferences = (element: object, declaration: Declaration) => {
+    if (declaration.prop.startsWith('--')) return;
+    const refs = variableReferences(declaration.value);
+    if (!refs.size) return;
+    const needed = paintVariables.get(element) || new Set<string>();
+    refs.forEach((ref) => {
+      if (!needed.has(ref)) { budget.visit(); needed.add(ref); }
+    });
+    paintVariables.set(element, needed);
+  };
+  loaded.forEach(({ $ }) => {
+    $('[style]').each((_, element) => {
+      try {
+        postcss.parse(`x{${$(element).attr('style') || ''}}`).walkDecls((declaration) => { addPaintReferences(element, declaration); });
+      } catch { uncertainVariableSyntax = true; }
+    });
+  });
+  const converted = new Set<Declaration>();
+  const inlineDeclarations = new WeakSet<Declaration>();
+  let order = 0;
+  const warn = budget.warn;
+  type Recipe = Array<{ key: string; candidate: StrictCandidate }>;
+  const recipes: Recipe[] = [];
+  const compileDeclaration = (
     declaration: Declaration,
     specificity: Specificity,
     conditions: StrictCondition[],
@@ -502,7 +713,11 @@ function convertStrictTailwind(
     layer: number[] = []
   ) => {
     if (inline) inlineDeclarations.add(declaration);
-    const property = declaration.prop.startsWith('--') ? declaration.prop : declaration.prop.toLowerCase();
+    const sourceProperty = declaration.prop.startsWith('--') ? declaration.prop : declaration.prop.toLowerCase();
+    // Chromium serializes background-clip:text under its WebKit alias. Resolve
+    // both names in one cascade group so shorthand resets cannot compete later
+    // through Tailwind's alphabetical utility order and paint a solid rectangle.
+    const property = sourceProperty === '-webkit-background-clip' ? 'background-clip' : sourceProperty;
     const value = declaration.value.trim();
     if (!/^(?:--[\w-]+|[-a-zA-Z][\w-]*)$/.test(property) || !value || /[{};]/.test(value)) {
       warn(
@@ -522,21 +737,30 @@ function convertStrictTailwind(
       );
       return;
     }
-    const list = loaded[documentIndex].candidates.get(element) || [];
-    strictLonghands(property, value).forEach(([prop, val]) =>
-      list.push({
-        property: prop,
-        value: val,
-        declaration,
-        inline,
-        specificity,
-        layer,
-        conditions,
-        pseudo,
-        order: sourceOrder,
-      })
-    );
-    loaded[documentIndex].candidates.set(element, list);
+    budget.check('conditionsPerCandidate', conditions.length);
+    for (const condition of conditions) budget.check('classLength', condition.value.length);
+    budget.check('classLength', property.length + value.length);
+    // Compile longhands and activation keys once per selector/declaration, not
+    // once per matched element. Recipes themselves are bounded compilation work.
+    const conditionKey = [...new Set(conditions.map(condition => JSON.stringify([condition.kind, condition.value])))].sort();
+    return strictLonghands(property, value).map(([prop, val]) => {
+      budget.visit();
+      return {
+        key: JSON.stringify([pseudo, prop, conditionKey]),
+        candidate: {
+          property: prop, value: val, declaration, inline, specificity,
+          layer, conditions, pseudo, order: sourceOrder,
+        } satisfies StrictCandidate,
+      };
+    });
+  };
+  const assign = (assignments: Map<object, number[]>, element: object, recipeId: number) => {
+    // One reference per selector match (not per declaration/longhand). Charging
+    // it before retention gives this compact match graph a cumulative hard cap.
+    budget.visit();
+    const refs = assignments.get(element);
+    if (refs) refs.push(recipeId);
+    else assignments.set(element, [recipeId]);
   };
   root.walkDecls(() => {
     stats.declarationsSeen++;
@@ -632,41 +856,138 @@ function convertStrictTailwind(
         continue;
       }
       const queryText = query.toString().trim() || '*';
-      loaded.forEach(({ $ }, documentIndex) => {
+      const recipe = declarations.flatMap((item) =>
+        compileDeclaration(item.declaration, specificity, localConditions, pseudo, false, item.order, layer) || []
+      );
+      if (!recipe.length) continue;
+      const recipeId = recipes.push(recipe) - 1;
+      const paintRefs = new Set<string>();
+      declarations.forEach((item) => {
+        if (!item.declaration.prop.startsWith('--'))
+          variableReferences(item.declaration.value).forEach((ref) => paintRefs.add(ref));
+      });
+      loaded.forEach(({ $, assignments }) => {
         try {
           $(queryText).each((_, element) => {
-            declarations.forEach((item) =>
-              add(
-                documentIndex,
-                element,
-                item.declaration,
-                specificity,
-                localConditions,
-                pseudo,
-                false,
-                item.order,
-                layer
-              )
-            );
+            if (paintRefs.size) {
+              const needed = paintVariables.get(element) || new Set<string>();
+              paintRefs.forEach((ref) => {
+                if (!needed.has(ref)) { budget.visit(); needed.add(ref); }
+              });
+              paintVariables.set(element, needed);
+            }
+            assign(assignments, element, recipeId);
           });
-        } catch {
+        } catch (error) {
+          rethrowBudget(error);
           warn('Selector is not supported by the static DOM matcher; rule omitted.', selector.toString());
         }
       });
     }
   });
-  loaded.forEach(({ $, candidates }, documentIndex) => {
-    $('[style]').each((_, element) => {
-      try {
-        postcss.parse(`x{${$(element).attr('style') || ''}}`).walkDecls((declaration) => {
-          add(documentIndex, element, declaration, [0, 0, 0], [], '', true, order++);
-        });
-      } catch {
-        warn('Malformed inline CSS omitted rather than retained.');
+  const closeVariables = (variables: Set<string>) => {
+    const queue = [...variables];
+    for (let i = 0; i < queue.length; i++) {
+      for (const dependency of variableDependencies.get(queue[i]) || []) {
+        if (variables.has(dependency)) continue;
+        budget.visit();
+        variables.add(dependency);
+        queue.push(dependency);
       }
-      $(element).removeAttr('style');
+    }
+  };
+  closeVariables(globallyObservedVariables);
+  const inheritedNeeds = new WeakMap<object, Set<string>>();
+  if (!uncertainVariableSyntax) {
+    for (const [element, variables] of paintVariables) {
+      closeVariables(variables);
+      for (const variable of variables) {
+        if (globallyObservedVariables.has(variable)) continue;
+        for (let node: object | null = element; node; node = (node as { parent?: object | null }).parent || null) {
+          const needed = inheritedNeeds.get(node) || new Set<string>();
+          if (needed.has(variable)) break; // Its ancestor chain is already marked.
+          budget.visit();
+          needed.add(variable);
+          inheritedNeeds.set(node, needed);
+        }
+      }
+    }
+  }
+  paintVariables.clear();
+  // ALL stylesheet matching above used the complete unchanged source documents,
+  // including [style], exact [class], siblings and :has(style). From here on no
+  // source selector is evaluated, so resolving one element cannot affect another.
+  loaded.forEach(({ $, assignments }) => {
+    $('[style]').each((_, element) => {
+      if (!assignments.has(element)) assignments.set(element, []);
     });
-    for (const [element, list] of candidates) {
+    for (const [element, refs] of assignments) {
+      assignments.delete(element);
+      const winners = new Map<string, StrictCandidate>();
+      // Resolve content first, so universal pseudo resets never expand into
+      // declaration/element work for boxes that cannot be generated.
+      const pseudoContent = new Map<string, StrictCandidate[]>();
+      for (const recipeId of refs) {
+        for (const { candidate } of recipes[recipeId]) {
+          if (candidate.property !== 'content' || !['::before', '::after'].includes(candidate.pseudo)) continue;
+          const content = pseudoContent.get(candidate.pseudo) || [];
+          content.push(candidate);
+          pseudoContent.set(candidate.pseudo, content);
+        }
+      }
+      const possiblePseudos = new Set([...pseudoContent].filter(([, content]) =>
+        content.some(candidate => !/^(?:none|normal)$/i.test(candidate.value))).map(([pseudo]) => pseudo));
+      const apply = (recipe: Recipe) => {
+        for (const { key, candidate } of recipe) {
+          if (['::before', '::after'].includes(candidate.pseudo) && !possiblePseudos.has(candidate.pseudo)) continue;
+          // Only dialogs/popovers can enter the top layer without source scripts;
+          // ordinary nodes have no backdrop to receive universal resets.
+          if (candidate.pseudo === '::backdrop' && (element as { tagName?: string }).tagName !== 'dialog' &&
+            $(element as never).attr('popover') === undefined) continue;
+          if (candidate.property.startsWith('--') && !uncertainVariableSyntax &&
+            !globallyObservedVariables.has(candidate.property) && !inheritedNeeds.get(element)?.has(candidate.property)) continue;
+          budget.visit();
+          const previous = winners.get(key);
+          if (previous && compareStrict(candidate, previous) <= 0) continue;
+          if (!previous) {
+            budget.check('candidatesPerElement', winners.size + 1);
+            budget.expand();
+          }
+          winners.set(key, candidate);
+        }
+      };
+      for (const recipeId of refs) apply(recipes[recipeId]);
+      if ($(element as never).attr('style') !== undefined) {
+        try {
+          postcss.parse(`x{${$(element as never).attr('style') || ''}}`).walkDecls((declaration) => {
+            apply(compileDeclaration(declaration, [0, 0, 0], [], '', true, order++) || []);
+          });
+        } catch (error) {
+          rethrowBudget(error);
+          warn('Malformed inline CSS omitted rather than retained.');
+        }
+        $(element as never).removeAttr('style');
+      }
+      // Before/after boxes exist only when content generates them. Emitting reset
+      // utilities there would both bloat every element and let Tailwind's automatic
+      // pseudo content create boxes that were absent in the source document.
+      const generatedPseudos = new Set([...winners.values()]
+        .filter(candidate => candidate.property === 'content' && !/^(?:none|normal)$/i.test(candidate.value))
+        .map(candidate => candidate.pseudo));
+      const pseudoVariables = new Map<string, Set<string>>();
+      for (const candidate of winners.values()) {
+        if (!candidate.pseudo || candidate.property.startsWith('--')) continue;
+        const needed = pseudoVariables.get(candidate.pseudo) || new Set<string>();
+        variableReferences(candidate.value).forEach(ref => needed.add(ref));
+        pseudoVariables.set(candidate.pseudo, needed);
+      }
+      for (const needed of pseudoVariables.values()) closeVariables(needed);
+      const list = [...winners.values()].filter(candidate => {
+        if (['::before', '::after'].includes(candidate.pseudo) && !generatedPseudos.has(candidate.pseudo)) return false;
+        if (candidate.pseudo && candidate.property.startsWith('--') && !uncertainVariableSyntax &&
+          !globallyObservedVariables.has(candidate.property) && !pseudoVariables.get(candidate.pseudo)?.has(candidate.property)) return false;
+        return true;
+      });
       const pending: Array<{ variant: string; property: string; value: string }> = [];
       const opaqueShorthands: Record<string, string> = {
         font: 'font-',
@@ -696,6 +1017,7 @@ function convertStrictTailwind(
       list.forEach((candidate) => {
         const key = `${candidate.pseudo}|${candidate.property}`;
         const group = groups.get(key) || [];
+        budget.check('conditionsPerGroup', group.length + 1);
         group.push(candidate);
         groups.set(key, group);
       });
@@ -708,6 +1030,7 @@ function convertStrictTailwind(
           if (higher.some((other) => other.conditions.every((condition) => current.has(key(condition)))))
             continue;
           let variant = candidate.conditions.map(conditionVariant).join('');
+          budget.check('classLength', variant.length);
           let unsupported = false;
           for (const other of higher) {
             const extra = other.conditions.filter((condition) => !current.has(key(condition)));
@@ -742,6 +1065,7 @@ function convertStrictTailwind(
               unsupported = true;
               break;
             }
+            budget.check('classLength', variant.length);
           }
           if (unsupported) {
             warn(
@@ -762,8 +1086,17 @@ function convertStrictTailwind(
           higher.push(candidate);
         }
       }
-      // Recombine equal winning sides into readable p-5 / px-2 / gap-1 classes.
+      // Recombine equal winning border longhands only after cascade resolution.
+      // Universal resets otherwise repeat twelve arbitrary classes per element.
       for (const variant of new Set(pending.map((item) => item.variant))) {
+        for (const part of ['width', 'style', 'color']) {
+          const sides = ['top', 'right', 'bottom', 'left'].map(side =>
+            pending.find(item => item.variant === variant && item.property === `border-${side}-${part}`));
+          if (sides.some(side => !side) || !sides.every(side => side!.value === sides[0]!.value)) continue;
+          for (const side of sides) pending.splice(pending.indexOf(side!), 1);
+          pending.push({ variant, property: `border-${part}`, value: sides[0]!.value });
+        }
+        // Recombine equal winning sides into readable p-5 / px-2 / gap-1 classes.
         for (const base of ['padding', 'margin', 'gap']) {
           const properties =
             base === 'gap'
@@ -805,16 +1138,16 @@ function convertStrictTailwind(
             });
             const utility = strictUtility(base, entries[0]!.value).replace(/^(\-?)[mp]-/, `$1${prefix}-`);
             const className = `${variant}${utility}`;
-            appendClass($, element, className);
-            utilities.add(className);
+            budget.addClass($, element, className);
           }
         }
       }
       pending.forEach((item) => {
         const className = `${item.variant}${strictUtility(item.property, item.value)}`;
-        appendClass($, element, className);
-        utilities.add(className);
+        budget.addClass($, element, className);
       });
+      budget.flushClasses($, element);
+      budget.release(winners.size);
     }
     $('style, link[rel~="stylesheet"], link[as="style"]').remove();
   });
@@ -899,16 +1232,6 @@ function mediaVariant(rule: Rule): string | null {
   return variant;
 }
 
-function appendClass($: LoadedDocument, element: unknown, className: string): void {
-  const current =
-    $(element as never)
-      .attr('class')
-      ?.split(/\s+/)
-      .filter(Boolean) || [];
-  if (!current.includes(className)) current.push(className);
-  $(element as never).attr('class', current.join(' '));
-}
-
 function referencedClasses(root: postcss.Root): Set<string> {
   const classes = new Set<string>();
   const collect = (text: string) => {
@@ -944,11 +1267,17 @@ function pruneEmptyContainers(root: postcss.Root): void {
 export function convertDocumentsToTailwind(
   documents: readonly TailwindDocumentInput[],
   css: string,
-  options: { strict?: boolean } = {}
+  options: { strict?: boolean; limits?: Partial<TailwindConversionLimits> } = {}
 ): TailwindConversionResult {
-  if (options.strict) return convertStrictTailwind(documents, css);
+  const budget = createBudget(options.limits);
+  budget.check('cssBytes', Buffer.byteLength(css));
+  let htmlBytes = 0;
+  for (const document of documents) {
+    budget.check('htmlBytes', htmlBytes += Buffer.byteLength(document.html));
+  }
+  if (options.strict) return convertStrictTailwind(documents, css, budget);
   const loaded = documents.map((document) => ({ document, $: cheerio.load(document.html) }));
-  const warnings: TailwindConversionWarning[] = [];
+  const { warnings } = budget;
   const stats = {
     declarationsSeen: 0,
     declarationsConverted: 0,
@@ -987,10 +1316,17 @@ export function convertDocumentsToTailwind(
     const classes = generatedClasses[documentIndex].get(node) || new Set<string>();
     classes.add(className);
     generatedClasses[documentIndex].set(node, classes);
-    appendClass(loaded[documentIndex].$, element, className);
+    budget.addClass(loaded[documentIndex].$, element, className);
   };
   const candidates: Candidate[] = [];
   const elementIds = loaded.map(() => ({ ids: new WeakMap<object, number>(), next: 0 }));
+  const targetCounts = loaded.map(() => new WeakMap<object, number>());
+  const countTarget = (documentIndex: number, element: object) => {
+    budget.expand();
+    const count = (targetCounts[documentIndex].get(element) || 0) + 1;
+    budget.check('candidatesPerElement', count);
+    targetCounts[documentIndex].set(element, count);
+  };
   root.walkDecls(() => {
     stats.declarationsSeen++;
   });
@@ -1007,6 +1343,7 @@ export function convertDocumentsToTailwind(
       if (!utility) return;
 
       selectors.forEach((selector) => {
+        budget.check('classLength', `${responsive}${selector.variant}${utility}`.length);
         const targets: Candidate['targets'] = [];
         loaded.forEach(({ $ }, documentIndex) => {
           try {
@@ -1017,13 +1354,15 @@ export function convertDocumentsToTailwind(
                 elementId = elementIds[documentIndex].next++;
                 elementIds[documentIndex].ids.set(elementObject, elementId);
               }
+              countTarget(documentIndex, elementObject);
               targets.push({
                 documentIndex,
                 element,
                 key: `${documentIndex}:${elementId}:${responsive}${selector.variant}`,
               });
             });
-          } catch {
+          } catch (error) {
+            rethrowBudget(error);
             // Cheerio selector rejection means the source rule must be preserved.
           }
         });
@@ -1087,13 +1426,16 @@ export function convertDocumentsToTailwind(
           for (const declaration of declarations) {
             const family = layoutFamily(declaration.prop.toLowerCase());
             if (!family) continue;
+            countTarget(documentIndex, element);
             const entries = families.get(family) || new Set<Declaration>();
-            entries.add(declaration);
+            // Only distinguish zero/one/multiple declarations for layout safety.
+            if (entries.size < 2) entries.add(declaration);
             families.set(family, entries);
           }
           layoutDeclarations[documentIndex].set(element, families);
         });
-      } catch {
+      } catch (error) {
+        rethrowBudget(error);
         /* Dynamic/pseudo-element selectors remain in source CSS. */
       }
     });
@@ -1109,11 +1451,11 @@ export function convertDocumentsToTailwind(
     )
       conflicts.add(candidate.declaration);
     if (conflicts.has(candidate.declaration)) {
-      warnings.push({
-        selector: (candidate.declaration.parent as Rule).selector,
-        property: candidate.property,
-        message: 'Preserved because multiple rules can set this property on the same element/state.',
-      });
+      budget.warn(
+        'Preserved because multiple rules can set this property on the same element/state.',
+        (candidate.declaration.parent as Rule).selector,
+        candidate.property
+      );
       continue;
     }
     for (const target of candidate.targets) {
@@ -1141,6 +1483,7 @@ export function convertDocumentsToTailwind(
       if (!rule) return;
       const residual: string[] = [];
       rule.walkDecls((declaration) => {
+        countTarget(documentIndex, element);
         // Inline geometry must keep its original specificity over resets and
         // source rules, including shorthand/longhand relationships.
         if (
@@ -1163,6 +1506,9 @@ export function convertDocumentsToTailwind(
     });
   });
 
+  loaded.forEach(({ $ }) => {
+    $('*').each((_, element) => budget.flushClasses($, element));
+  });
   pruneEmptyContainers(root);
 
   const residualClasses = referencedClasses(root);

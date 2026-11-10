@@ -5,6 +5,7 @@ export async function waitForRenderedContent(page: Page, timeoutMs = 20000): Pro
   const prepare = async (budget: number) => {
       const captureStarted = Date.now();
       const deadline = captureStarted + budget;
+      const restoreReserve = Math.min(1000, budget * 0.15);
       const delay = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
       const excluded = 'dialog,[hidden],[aria-hidden="true"],[inert],[role="menu"],[role="dialog"]';
       const revealSelector = '[data-aos],[data-sr-id],[data-scroll-reveal],.wow';
@@ -84,7 +85,7 @@ export async function waitForRenderedContent(page: Page, timeoutMs = 20000): Pro
       const sweep = async (container?: HTMLElement) => {
         let position = 0;
         let bottomRounds = 0;
-        while (Date.now() < deadline - 1000 && bottomRounds < 2) {
+        while (Date.now() < deadline - restoreReserve && bottomRounds < 2) {
           const viewport = container ? container.clientHeight : innerHeight;
           const height = container ? container.scrollHeight : Math.max(document.documentElement.scrollHeight, document.body?.scrollHeight || 0);
           const bottom = Math.max(0, height - viewport);
@@ -94,17 +95,19 @@ export async function waitForRenderedContent(page: Page, timeoutMs = 20000): Pro
           // Reserve time to reach the footer on long pages; a fixed delay per
           // viewport can exhaust the entire budget before lower sections appear.
           const remainingSteps = Math.max(1, Math.ceil((bottom - position) / Math.max(100, viewport * 0.75)) + 2);
-          const available = Math.max(0, deadline - Date.now() - 1000);
-          const slice = Math.min(2500, Math.max(100, available / remainingSteps));
+          const available = Math.max(0, deadline - Date.now() - restoreReserve);
+          // Do not impose a 100ms floor: on a long directory that consumes the
+          // whole budget before reaching the information sections near its end.
+          const slice = Math.min(2500, available / remainingSteps);
           await settleViewport(slice, Math.min(1200, slice * 0.6));
           // Discover roots as lazy sections mount. Visit them while their parent
           // section is in view; scrolling a clipped offscreen root cannot reveal it.
           if (!container) {
             for (const root of document.querySelectorAll<HTMLElement>('body *')) {
-              if (Date.now() >= deadline - 1000) break;
-              if (containerPositions.has(root) || root.closest(excluded) || !inViewport(root) ||
-                  root.clientHeight < 100 || root.scrollHeight <= root.clientHeight + 1 ||
-                  !/(auto|scroll)/.test(getComputedStyle(root).overflowY)) continue;
+              if (Date.now() >= deadline - restoreReserve) break;
+              if (root.clientHeight < 100 || root.scrollHeight <= root.clientHeight + 1 ||
+                  containerPositions.has(root) || !/(auto|scroll)/.test(getComputedStyle(root).overflowY) ||
+                  root.closest(excluded) || !inViewport(root)) continue;
               containerPositions.set(root, { top: root.scrollTop, left: root.scrollLeft });
               await sweep(root);
             }
@@ -117,6 +120,21 @@ export async function waitForRenderedContent(page: Page, timeoutMs = 20000): Pro
       };
       try {
         await Promise.race([document.fonts?.ready || Promise.resolve(), delay(Math.min(2000, budget / 4))]);
+        // Long directories can put editorial sections after thousands of cards.
+        // Give semantic section landmarks a bounded first pass so expensive DOM
+        // sampling cannot starve lower scroll observers before the linear sweep.
+        const pageHeight = Math.max(document.documentElement.scrollHeight, document.body?.scrollHeight || 0);
+        if (pageHeight > innerHeight * 8) {
+          const landmarks = Array.from(document.querySelectorAll<HTMLElement>('section,article'))
+            .filter(element => !element.closest(excluded) && element.querySelector('h1,h2,h3,p') && element.getBoundingClientRect().height > 50)
+            .slice(-24);
+          const landmarkDeadline = Math.min(deadline - restoreReserve, Date.now() + budget * 0.45);
+          for (let index = 0; index < landmarks.length && Date.now() < landmarkDeadline; index++) {
+            landmarks[index].scrollIntoView({ block: 'center', behavior: 'instant' });
+            const slice = Math.max(0, (landmarkDeadline - Date.now()) / (landmarks.length - index));
+            await settleViewport(slice, Math.min(1200, slice * 0.6));
+          }
+        }
         await sweep();
         // Finish finite animations only; infinite effects and scroll timelines
         // must never make capture wait forever. Visible states above take priority.

@@ -29,7 +29,7 @@ const ATTRIBUTE_MAP: Record<string, string> = {
   class: 'className', for: 'htmlFor', 'accept-charset': 'acceptCharset', acceptcharset: 'acceptCharset',
   charset: 'charSet', datetime: 'dateTime', 'http-equiv': 'httpEquiv', httpequiv: 'httpEquiv',
   itemid: 'itemID', itemprop: 'itemProp', itemref: 'itemRef', itemscope: 'itemScope', itemtype: 'itemType',
-  fetchpriority: 'fetchPriority', referrerpolicy: 'referrerPolicy', playsinline: 'playsInline',
+  fetchpriority: 'fetchPriority', referrerpolicy: 'referrerPolicy', playsinline: 'playsInline', autoplay: 'autoPlay',
   spellcheck: 'spellCheck', contenteditable: 'contentEditable', tabindex: 'tabIndex', autocomplete: 'autoComplete',
   autofocus: 'autoFocus', readonly: 'readOnly', novalidate: 'noValidate', formnovalidate: 'formNoValidate',
   formaction: 'formAction', formmethod: 'formMethod', formenctype: 'formEncType', formtarget: 'formTarget',

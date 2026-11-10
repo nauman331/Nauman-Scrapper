@@ -4,7 +4,7 @@ import { cssUrlPattern, unquoteCssUrl } from './css-urls.js';
 export interface DiscoveredAsset {
   originalUrl: string;
   sourcePageUrl: string;
-  type: 'image' | 'animation' | 'stylesheet' | 'font' | 'icon' | 'other';
+  type: 'image' | 'video' | 'animation' | 'stylesheet' | 'font' | 'icon' | 'other';
   htmlTag?: string;
   suggestedLocalName: string;
 }
@@ -19,7 +19,8 @@ export class AssetCollector {
     const seenUrls = new Set<string>();
 
     const addAsset = (rawUrl: string | undefined, type: DiscoveredAsset['type'], tag?: string) => {
-      if (!rawUrl || rawUrl.trim() === '' || rawUrl.startsWith('data:') || rawUrl.startsWith('blob:') || rawUrl.startsWith('javascript:')) {
+      rawUrl = rawUrl && unquoteCssUrl(rawUrl);
+      if (!rawUrl || /^(?:data:|blob:|javascript:|#)/i.test(rawUrl)) {
         return;
       }
 
@@ -71,8 +72,12 @@ export class AssetCollector {
       if (value && this.looksLikeImageUrl(value)) addAsset(value, 'image', el.tagName);
     });
 
-    $('video').each((_, el) => addAsset($(el).attr('poster'), 'image', 'video-poster'));
-    $('video source, audio source').each((_, el) => addAsset($(el).attr('src'), 'other', 'media-source'));
+    $('video').each((_, el) => {
+      addAsset($(el).attr('poster'), 'image', 'video-poster');
+      addAsset($(el).attr('src'), 'video', 'video');
+    });
+    $('video source').each((_, el) => addAsset($(el).attr('src'), 'video', 'media-source'));
+    $('audio, audio source').each((_, el) => addAsset($(el).attr('src'), 'other', 'media-source'));
     $('object[data]').each((_, el) => addAsset($(el).attr('data'), 'other', 'object'));
     $('embed[src]').each((_, el) => addAsset($(el).attr('src'), 'other', 'embed'));
     $('input[type="image"][src]').each((_, el) => addAsset($(el).attr('src'), 'image', 'input-image'));

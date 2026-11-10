@@ -33,6 +33,77 @@ describe('playground crawl scope', () => {
     else expect(message.innerText).toBe('Test complete.');
   });
 
+  it('renders the bulk test button and labeled result badges at the top of proxies', () => {
+    const $ = load(html);
+    expect($('#btnTestAllProxies').attr('onclick')).toBe('testAllProxies()');
+    expect($('#btnTestAllProxies').attr('disabled')).toBeDefined();
+    expect($('.proxy-page-intro .proxy-test-badges').attr('aria-label')).toBe('Proxy test results');
+    expect($('.proxy-test-success').text()).toBe('Succeeded 0');
+    expect($('.proxy-test-failed').text()).toBe('Failed 0');
+    expect($('.proxy-test-total').text()).toBe('Total 0');
+    expect($('#proxyTestProgress').attr('aria-live')).toBe('polite');
+  });
+
+  it('tests every proxy with bounded concurrency and counts health and request failures', async () => {
+    const $ = load(html);
+    const source = $('script').map((_, element) => $(element).html()).get().join('\n');
+    const state = source.slice(source.indexOf('    let proxyTestsRunning'), source.indexOf('    async function loadProxies()'));
+    const action = source.slice(source.indexOf('    async function testAllProxies()'), source.indexOf('    async function testProxy('));
+    const elements: Record<string, { innerText: string; disabled: boolean }> = {};
+    const element = (id: string) => elements[id] ??= { innerText: '', disabled: false };
+    const items = Array.from({ length: 12 }, (_, index) => ({ id: String(index) }));
+    let active = 0;
+    let peak = 0;
+    const request = vi.fn(async (url: string) => {
+      if (url === '/api/v1/proxies') return items;
+      active++;
+      peak = Math.max(peak, active);
+      await new Promise(resolve => setTimeout(resolve, 1));
+      active--;
+      if (url.endsWith('/2/test')) throw new Error('Network error');
+      return { status: url.endsWith('/1/test') ? 'NOT_WORKING' : 'WORKING' };
+    });
+    const refresh = vi.fn();
+    const context = createContext({
+      document: { getElementById: element, querySelectorAll: () => [] },
+      proxyRequest: request, loadProxies: refresh,
+    });
+    runInContext(state + action + '\nsavedProxyCount = 12;', context);
+    const pending = runInContext('testAllProxies()', context);
+    expect(element('btnTestAllProxies').disabled).toBe(true);
+    await runInContext('testAllProxies()', context);
+    await pending;
+    expect(request).toHaveBeenCalledTimes(13);
+    expect(peak).toBe(5);
+    expect(request).toHaveBeenCalledWith('/api/v1/proxies/0/test', { method: 'POST', body: '{}' });
+    expect(element('proxySucceededCount').innerText).toBe('10');
+    expect(element('proxyFailedCount').innerText).toBe('2');
+    expect(element('proxyTestTotalCount').innerText).toBe('12');
+    expect(element('proxyTestProgress').innerText).toContain('Test complete: 10 succeeded, 2 failed, 12 total.');
+    expect(element('proxyTestProgress').innerText).toContain('1 test requests could not complete');
+    expect(element('btnTestAllProxies').disabled).toBe(false);
+    expect(element('btnTestAllProxies').innerText).toBe('Test all proxies');
+    expect(refresh).toHaveBeenCalledOnce();
+  });
+
+  it('restores the bulk test button when loading proxies fails', async () => {
+    const $ = load(html);
+    const source = $('script').map((_, element) => $(element).html()).get().join('\n');
+    const state = source.slice(source.indexOf('    let proxyTestsRunning'), source.indexOf('    async function loadProxies()'));
+    const action = source.slice(source.indexOf('    async function testAllProxies()'), source.indexOf('    async function testProxy('));
+    const button = { innerText: '', disabled: false };
+    const progress = { innerText: '' };
+    const context = createContext({
+      document: { getElementById: (id: string) => id === 'btnTestAllProxies' ? button : progress, querySelectorAll: () => [] },
+      proxyRequest: vi.fn().mockRejectedValue(new Error('Unauthorized')),
+    });
+    runInContext(state + action + '\nsavedProxyCount = 1;', context);
+    await runInContext('testAllProxies()', context);
+    expect(progress.innerText).toBe('Could not test proxies: Unauthorized');
+    expect(button.disabled).toBe(false);
+    expect(runInContext('proxyTestsRunning', context)).toBe(false);
+  });
+
   it('renders accessible crawl scope choices and constrained page count', () => {
     expect(html).toContain('<legend class="form-label">Crawl Scope</legend>');
     expect(html).toContain('value="landing" checked');

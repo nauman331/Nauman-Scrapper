@@ -41,6 +41,30 @@ describe('HTML + Core CSS', () => {
     expect(result.stats.inlineDeclarationsConverted).toBe(7);
   });
 
+  it('localizes single and responsive video sources without losing media order, flags or poster', async () => {
+    const id = makeId();
+    vi.spyOn(assetDownloader, 'resolveAssets').mockImplementation(async conversionId => {
+      const downloadedAssets = await Promise.all(['mobile.mp4', 'desktop.mp4', 'single.mp4', 'poster.jpg'].map(async filename => {
+        const video = filename.endsWith('.mp4');
+        const directory = video ? 'videos' : 'images';
+        await conversionStorage.writeFileSafe(conversionId, `public/${directory}/${filename}`, Buffer.from([0, 1, 2, 3]));
+        return { originalUrl: `https://site.test/${filename}`, localPath: `public/${directory}/${filename}`, publicUrl: `/${directory}/${filename}`, mimeType: video ? 'video/mp4' : 'image/jpeg', sizeBytes: 4, hash: filename, isSvg: false, isFont: false, isStylesheet: false, isImage: !video };
+      }));
+      return { downloadedAssets, missingAssets: [], consolidatedCss: 'section{position:relative;height:100vh}video{position:absolute;inset:0;width:100%;height:100%;object-fit:cover}' };
+    });
+    await exportStandaloneHtml({ conversionId: id, jobId: 'job', targetUrl: 'https://site.test/', domain: 'site.test', pages: [{ url: 'https://site.test/', rawData: { html: '<section><div><video autoplay muted loop playsinline poster="/poster.jpg"><source src="/mobile.mp4" type="video/mp4" media="(max-width: 767px)"><source src="/desktop.mp4" type="video/mp4"></video></div></section><video src="/single.mp4" controls></video>' } }], options: HtmlConversionOptionsSchema.parse({ cssStrategy: 'core' }) });
+    const dom = cheerio.load((await conversionStorage.readFileSafe(id, 'index.html'))!);
+    expect(dom('section > div > video')).toHaveLength(1);
+    expect(dom('video source').map((_, element) => dom(element).attr('src')).get()).toEqual(['assets/videos/mobile.mp4', 'assets/videos/desktop.mp4']);
+    expect(dom('source').first().attr('media')).toBe('(max-width: 767px)');
+    expect(dom('source').last().attr('media')).toBeUndefined();
+    expect(dom('video[src]').attr('src')).toBe('assets/videos/single.mp4');
+    expect(dom('video').first().attr('poster')).toBe('assets/images/common/poster.jpg');
+    for (const attribute of ['controls', 'muted', 'loop', 'playsinline']) expect(dom('video').first().attr(attribute)).toBeDefined();
+    expect(dom('video').first().attr('autoplay')).toBeUndefined();
+    expect((await conversionStorage.readPreviewFileSafe(id, 'assets/videos/desktop.mp4'))?.length).toBe(4);
+  });
+
   it('exports isolated page CSS, inline assets and SVG styling without Tailwind or final commands', async () => {
     const id = makeId();
     vi.spyOn(assetDownloader, 'resolveAssets').mockImplementation(async conversionId => {
@@ -376,8 +400,14 @@ describe('Standalone HTML + Tailwind exporter', () => {
     expect(result.missingAssets).toEqual([]);
     expect(result.pageFiles[0].cssPath).toBe('');
     const css = await readTailwindPreviewCss(id);
-    expect(css).not.toContain('@font-face');
-    expect(result.warnings.join(' ')).toContain('@font-face');
+    expect(css).toContain('@font-face');
+    expect(result.warnings.join(' ')).not.toContain('Unsupported @font-face');
+    const fontSheet = (await conversionStorage.readFileSafe(id, 'assets/fonts/fonts.css'))!;
+    expect(fontSheet).toContain('@font-face');
+    expect(fontSheet).toMatch(/url\("[a-f0-9]+_custom\.woff2"\)/);
+    const fontUrl = fontSheet.match(/url\("([^"]+)"\)/)![1];
+    expect(await conversionStorage.readPreviewFileSafe(id, 'assets/fonts/' + fontUrl)).not.toBeNull();
+    expect(await conversionStorage.readFileSafe(id, 'index.html')).toContain('data-cloned-fonts');
     expect(css).toContain('assets/images/');
     expect(css).not.toContain('@import'); expect(css).not.toContain('https://site.test/');
   });

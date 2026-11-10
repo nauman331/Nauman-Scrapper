@@ -13,6 +13,249 @@ const html = '<div id="hero" class="card container" style="color:orange;width:24
 const compile = async (utilities: string[]) => (await postcss([tailwindcss({ content: [], safelist: utilities, corePlugins: { preflight: false } })]).process('@tailwind utilities;', { from: undefined })).css;
 
 describe('strict Tailwind conversion', () => {
+  const documents = [{ id: 'budget', html: '<div class="card"></div>' }];
+  const expectBudget = (run: () => unknown, name: string) => {
+    expect(run).toThrow(Error);
+    expect(run).toThrow(new RegExp(`${name} budget.*Core CSS.*fewer pages`));
+  };
+
+  it('rejects aggregate UTF-8 input before parsing, in both modes', () => {
+    for (const strict of [true, false]) {
+      expectBudget(() => convertDocumentsToTailwind([
+        { id: 'a', html: 'éé' }, { id: 'b', html: 'éé' },
+      ], '', { strict, limits: { htmlBytes: 7 } }), 'htmlBytes');
+      expectBudget(() => convertDocumentsToTailwind(documents, '/*éé*/', {
+        strict, limits: { cssBytes: 7 },
+      }), 'cssBytes');
+    }
+  });
+
+  it('never swallows expanded candidate or inline limits in matcher/parser catches', () => {
+    expectBudget(() => convertDocumentsToTailwind(documents, '.card{border:1px solid red}', {
+      strict: true, limits: { expandedCandidates: 4 },
+    }), 'expandedCandidates');
+    expectBudget(() => convertDocumentsToTailwind([{ id: 'inline', html: '<div style="padding:4px"></div>' }], '', {
+      strict: true, limits: { expandedCandidates: 3 },
+    }), 'expandedCandidates');
+    expectBudget(() => convertDocumentsToTailwind(documents, '.card{display:flex;color:red}', {
+      strict: true, limits: { candidatesPerElement: 1 },
+    }), 'candidatesPerElement');
+    expectBudget(() => convertDocumentsToTailwind([{ id: 'inline', html: '<div style="color:red;opacity:.5"></div>' }], '', {
+      limits: { expandedCandidates: 1 },
+    }), 'expandedCandidates');
+  });
+
+  it('charges retained winners rather than discarded duplicate work to the heap budget', () => {
+    const pages = [{ id: 'broad', html: '<div class="card"></div>'.repeat(251) }];
+    const css = '.card{display:block;display:flex}'.repeat(1000);
+    const result = convertDocumentsToTailwind(pages, css, { strict: true, limits: { expandedCandidates: 251 } });
+    expect(cheerio.load(result.documents[0].html)('.card.flex')).toHaveLength(251);
+    expectBudget(() => convertDocumentsToTailwind(pages, css, {
+      strict: true, limits: { candidateVisits: 1000 },
+    }), 'candidateVisits');
+    const released = convertDocumentsToTailwind(pages, '.card{display:flex;color:red}', {
+      strict: true, limits: { expandedCandidates: 2 },
+    });
+    expect(cheerio.load(released.documents[0].html)('.card.flex')).toHaveLength(251);
+    expectBudget(() => convertDocumentsToTailwind(pages, '.card{display:flex;color:red}', {
+      strict: true, limits: { expandedCandidates: 1 },
+    }), 'expandedCandidates');
+  });
+
+  it('exports more than 250k aggregate winners while retaining only one element cascade', () => {
+    const count = 21_000; // border expands to 12 winners per element: 252,000 total.
+    const result = convertDocumentsToTailwind([
+      { id: 'large', html: '<div class="card"></div>'.repeat(count) },
+    ], '.card{border:1px solid red}', { strict: true, limits: { expandedCandidates: 12 } });
+    const dom = cheerio.load(result.documents[0].html);
+    expect(dom('.card')).toHaveLength(count);
+    expect(dom('.card').first().attr('class')).toContain('[border-width:1px]');
+    expect(dom('.card').last().attr('class')).toContain('[border-width:1px]');
+    expect(result.stats.declarationsConverted).toBe(1);
+  });
+
+  it('matches ancestor, sibling, :has and exact attributes against the unchanged full document', () => {
+    const source = '<style>.unused{color:red}</style><section class="parent" style="color:red">' +
+      '<div class="first" style="display:block"></div><span class="later"></span></section>';
+    const result = convertDocumentsToTailwind([{ id: 'selectors', html: source }], `
+      .first{padding:4px}
+      [class="parent"][style] > [class="later"]{display:flex}
+      [style] + .later{color:blue}
+      section:has(.first[style]):has(> .later){opacity:.5}
+      html:has(style) .later{width:20px}
+    `, { strict: true, limits: { expandedCandidates: 8 } });
+    const dom = cheerio.load(result.documents[0].html);
+    expect(dom('.later').attr('class')).toContain('flex');
+    expect(dom('.later').attr('class')).toContain('text-[color:blue]');
+    expect(dom('.later').attr('class')).toContain('w-[20px]');
+    expect(dom('section').attr('class')).toContain('opacity-[.5]');
+    expect(dom('[style], style')).toHaveLength(0);
+    expect(result.stats.inlineDeclarationsConverted).toBe(2);
+  });
+
+  it('prunes only dead custom-property dependency graphs, retaining transitive CSS and inline references', () => {
+    const source = '<div class="card" style="--inline:var(--fallback);color:var(--inline)"></div>';
+    const result = convertDocumentsToTailwind([{ id: 'variables', html: source }], `
+      :root{--ink:var(--base,var(--backup));--base:red;--backup:blue;--fallback:orange;
+        --dead:var(--dead-child);--dead-child:black;--cycle-a:var(--cycle-b);--cycle-b:var(--cycle-a);
+        --tw-unused:0;--quoted:red;--animation-ink:purple}
+      @property --tw-unused{syntax:"*";inherits:false;initial-value:0}
+      .missing{color:var(--tw-unused)}
+      .card{background-color:var(--ink);content:"var(--quoted)"}
+      @keyframes paint{to{color:var(--animation-ink)}}
+    `, { strict: true });
+    const utilities = result.utilities!.join(' ');
+    for (const name of ['ink', 'base', 'backup', 'fallback', 'inline', 'animation-ink'])
+      expect(utilities).toContain(`[--${name}:`);
+    for (const name of ['dead', 'dead-child', 'cycle-a', 'cycle-b', 'tw-unused', 'quoted'])
+      expect(utilities).not.toContain(`[--${name}:`);
+    expect(utilities).toContain('[content:"var(--quoted)"]');
+    expect(result.stats.inlineDeclarationsConverted).toBe(2);
+    const conservative = convertDocumentsToTailwind([{ id: 'variables', html: source }], ':root{--dead:red}');
+    expect(conservative.residualCss).toContain('--dead:red');
+  });
+
+  it('retains custom properties observed by style queries or uncertain escaped CSS syntax', () => {
+    const queried = convertDocumentsToTailwind(documents, ':root{--query:red;--dead:blue}@container style(--query:red){.card{color:red}}', { strict: true });
+    expect(queried.utilities!.join(' ')).toContain('[--query:red]');
+    expect(queried.utilities!.join(' ')).not.toContain('[--dead:blue]');
+    const escaped = convertDocumentsToTailwind(documents, String.raw`:root{--ink:red;--dead:blue}.card{color:var(--\\69nk)}`, { strict: true });
+    expect(escaped.utilities!.join(' ')).toContain('[--dead:blue]');
+  });
+
+  it('retains variable definitions only where self, descendants or pseudo-elements can consume them', () => {
+    const result = convertDocumentsToTailwind([{ id: 'local', html: '<section><div class="consumer"></div><aside><span></span></aside></section>' }], `
+      *{--ink:var(--base);--base:red;--dead:blue}
+      .consumer{color:var(--ink)}
+      .consumer::before{content:var(--label)}
+      *{--label:"hello"}
+    `, { strict: true });
+    const dom = cheerio.load(result.documents[0].html);
+    expect(dom('section').attr('class')).toContain('[--ink:var(--base)]');
+    expect(dom('.consumer').attr('class')).toContain('[--base:red]');
+    expect(dom('.consumer').attr('class')).toContain('[--label:"hello"]');
+    expect(dom('aside, span').filter('[class]')).toHaveLength(0);
+    expect(result.utilities!.join(' ')).not.toContain('[--dead:blue]');
+  });
+
+  it('avoids broad conditional variable reset output while retaining consumers and ancestors', () => {
+    const support = '(((-webkit-hyphens:none)) and (not (margin-trim:inline))) or ((-moz-orient:inline) and (not (color:rgb(from red r g b))))';
+    const defaults = Array.from({ length: 40 }, (_, i) => `--reset-${i}:0`).join(';');
+    const result = convertDocumentsToTailwind([{ id: 'resets', html: '<section><i class="consumer"></i></section>' + '<div></div>'.repeat(500) }], `
+      @supports ${support}{*{${defaults}}}
+      .consumer{opacity:var(--reset-0)}
+    `, { strict: true, limits: { generatedClassBytes: 4096, expandedCandidates: 2 } });
+    const dom = cheerio.load(result.documents[0].html);
+    expect(dom('div').filter('[class]')).toHaveLength(0);
+    expect(dom('section').attr('class')).toContain('[--reset-0:0]');
+    expect(dom('.consumer').attr('class')).toContain('[--reset-0:0]');
+    expect(result.utilities!.join(' ')).not.toContain('[--reset-1:0]');
+  });
+
+  it('does not generate absent pseudo boxes or duplicate their universal resets', async () => {
+    const source = '<div class="plain"></div><div class="label"></div><div class="removed"></div>';
+    const css = '* ,::before,::after,::backdrop{--ink:red;box-sizing:border-box;border:0 solid red}' +
+      '::before,::after{--content:""}.label::before{content:"Label";color:var(--ink)}' +
+      '.removed::before{content:"Old"}.removed::before{content:none}';
+    const result = convertDocumentsToTailwind([{ id: 'pseudo-resets', html: source }], css, { strict: true });
+    const dom = cheerio.load(result.documents[0].html);
+    expect(dom('.plain').attr('class')).not.toMatch(/before:|after:|backdrop/);
+    expect(dom('.removed').attr('class')).not.toContain('before:');
+    expect(dom('.label').attr('class')).toContain('before:[content:"Label"]');
+    expect(dom('.label').attr('class')).toContain('before:[--ink:red]');
+    expect(dom('.label').attr('class')).not.toContain('after:');
+    expect(result.utilities!.join(' ')).not.toContain('--content');
+    const compiled = await compile(result.utilities!);
+    expect(compiled).toContain('border-width: 0');
+  });
+
+  it('keeps universal resets compact across eight large captured pages under the default byte budget', () => {
+    const css = '*,::before,::after,::backdrop{box-sizing:border-box;border:0 solid rgb(229,231,235)}' +
+      '::before,::after{--content:""}';
+    const result = convertDocumentsToTailwind(Array.from({ length: 8 }, (_, i) => ({
+      id: String(i), html: '<div></div>'.repeat(8000),
+    })), css, { strict: true });
+    expect(result.documents).toHaveLength(8);
+    expect(Buffer.byteLength(result.documents.map(document => document.html).join(''))).toBeLessThan(8 * 1024 * 1024);
+    expect(result.utilities).toEqual(expect.arrayContaining(['[border-width:0]', '[border-style:solid]']));
+    expect(result.utilities!.join(' ')).not.toMatch(/before:|after:|backdrop/);
+  });
+
+  it('bounds conditional fanout and nested activation sets', () => {
+    const css = Array.from({ length: 4 }, (_, i) => `@media(min-width:${i}px){.card{color:red}}`).join('');
+    expectBudget(() => convertDocumentsToTailwind(documents, css, {
+      strict: true, limits: { conditionsPerGroup: 3 },
+    }), 'conditionsPerGroup');
+    expectBudget(() => convertDocumentsToTailwind(documents, '@media(min-width:1px){@supports(display:grid){.card:hover{color:red}}}', {
+      strict: true, limits: { conditionsPerCandidate: 2 },
+    }), 'conditionsPerCandidate');
+  });
+
+  it('bounds unique utilities, utility bytes and generated class strings', () => {
+    for (const strict of [true, false]) {
+      expectBudget(() => convertDocumentsToTailwind(documents, '.card{display:flex;color:red}', {
+        strict, limits: { utilityCount: 1 },
+      }), 'utilityCount');
+      expectBudget(() => convertDocumentsToTailwind(documents, '.card{display:flex}', {
+        strict, limits: { utilityBytes: 3 },
+      }), 'utilityBytes');
+      expectBudget(() => convertDocumentsToTailwind(documents, '.card{display:flex}', {
+        strict, limits: { classLength: 3 },
+      }), 'classLength');
+      expectBudget(() => convertDocumentsToTailwind(documents, '.card{display:flex}', {
+        strict, limits: { elementClassLength: 8 },
+      }), 'elementClassLength');
+      expectBudget(() => convertDocumentsToTailwind(documents, '.card{display:flex}', {
+        strict, limits: { generatedClassBytes: 4 },
+      }), 'generatedClassBytes');
+    }
+  });
+
+  it('bounds conservative target and nonconvertible layout match products', () => {
+    const pages = [{ id: 'many', html: '<div class="card"></div>'.repeat(4) }];
+    expectBudget(() => convertDocumentsToTailwind(pages, '.card{color:red;color:blue}', {
+      limits: { expandedCandidates: 7 },
+    }), 'expandedCandidates');
+    // These complex-selector declarations never become migration candidates.
+    expectBudget(() => convertDocumentsToTailwind(pages, 'div.card{inline-size:4px;min-inline-size:2px}', {
+      limits: { expandedCandidates: 7 },
+    }), 'expandedCandidates');
+    expectBudget(() => convertDocumentsToTailwind(pages, 'div.card{inline-size:4px;min-inline-size:2px}', {
+      limits: { candidatesPerElement: 1 },
+    }), 'candidatesPerElement');
+  });
+
+  it('deduplicates repeated warnings and aborts excessive unique warnings', () => {
+    const result = convertDocumentsToTailwind([{ id: 'many', html: '<div class="card"></div>'.repeat(100) }], '.card{padding:0r}', {
+      strict: true, limits: { warningCount: 1 },
+    });
+    expect(result.warnings).toHaveLength(1);
+    expectBudget(() => convertDocumentsToTailwind(documents, '.card{padding:0r;margin:0r}', {
+      strict: true, limits: { warningCount: 1 },
+    }), 'warningCount');
+    expectBudget(() => convertDocumentsToTailwind(documents, '.card{padding:0r}', {
+      strict: true, limits: { warningBytes: 10 },
+    }), 'warningBytes');
+  });
+
+  it('compacts broad duplicate declarations without changing cascade winners', () => {
+    const source = '<div id="hero" class="card"></div>' + '<div class="card"></div>'.repeat(99);
+    const css = '@layer reset, utilities;@layer reset{*{color:red!important}}' +
+      Array.from({ length: 100 }, () => '.card{display:block;display:flex}').join('') +
+      '.card:hover{display:grid}.card:hover{display:inline}#hero{display:block}' +
+      '@layer utilities{.card{color:blue!important}}';
+    const result = convertDocumentsToTailwind([{ id: 'broad', html: source }], css, {
+      strict: true, limits: { candidatesPerElement: 3, conditionsPerGroup: 2 },
+    });
+    const dom = cheerio.load(result.documents[0].html);
+    expect(dom('#hero').hasClass('block')).toBe(true);
+    expect(dom('#hero').hasClass('hover:inline')).toBe(false);
+    expect(dom('div').last().hasClass('flex')).toBe(true);
+    expect(dom('div').last().hasClass('hover:inline')).toBe(true);
+    expect(dom('div').last().attr('class')).toContain('!text-[color:red]');
+    expect(result.utilities).not.toContain('hover:grid');
+    expect(result.utilities).not.toContain('!text-[color:blue]');
+  });
   it('converts layered resets, theme variables and nested utilities using native layer priority', async () => {
     const source = '<div id="hero" class="card"><span>Text</span></div>';
     const css = `@layer reset, theme, components, utilities;
@@ -142,7 +385,7 @@ describe('strict Tailwind conversion', () => {
     const result = convertDocumentsToTailwind([{ id: 'one', html: '<div class="card"></div>' }], '.card{color:red}.card{color:blue}');
     expect(result.residualCss).toContain('color:red');
     expect(result.residualCss).toContain('color:blue');
-    expect(result.warnings).toHaveLength(2);
+    expect(result.warnings).toHaveLength(1);
   });
 
   it('keeps literal asset URL underscores without introducing a backslash into filenames', async () => {

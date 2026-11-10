@@ -7,12 +7,80 @@ import { conversionStorage } from '../storage.js';
 import type { DiscoveredAsset } from './asset-collector.js';
 import type { DownloadedAsset } from '../types.js';
 import { logger } from '../../monitoring/logger.js';
-import { cssUrlPattern, unquoteCssUrl } from './css-urls.js';
-import { fetchThroughProxy, fetchProxyAsset } from '../../proxies/proxy-fetch.js';
+import { cssDataUrl, cssUrlPattern, unquoteCssUrl } from './css-urls.js';
+import { fetchThroughProxy } from '../../proxies/proxy-fetch.js';
 
-const MAX_ASSET_SIZE_BYTES = 10 * 1024 * 1024; // 10MB per asset limit
+const MAX_ASSET_SIZE_BYTES = 10 * 1024 * 1024; // 10MB for ordinary assets
+const MAX_VIDEO_SIZE_BYTES = 512 * 1024 * 1024;
 const FETCH_TIMEOUT_MS = 10000;
+const VIDEO_FETCH_TIMEOUT_MS = 120000;
+const VIDEO_URL_PATTERN = /\.(?:mp4|webm|ogv|mov|m4v)(?:[?#]|$)/i;
 const RETRYABLE_STATUSES = new Set([408, 429, 500, 502, 503, 504]);
+
+export interface AssetDownloadLimits {
+  maxConcurrent: number;
+  maxPerHost: number;
+  maxVideos: number;
+}
+const DEFAULT_DOWNLOAD_LIMITS: AssetDownloadLimits = { maxConcurrent: 4, maxPerHost: 2, maxVideos: 1 };
+
+/** Only network transfers hold permits: recursive CSS/optimizer work cannot deadlock the pool. */
+class AssetTransferScheduler {
+  private active = 0;
+  private videos = 0;
+  private readonly hosts = new Map<string, number>();
+  private readonly queue: Array<{ host: string; video: boolean; resolve: (release: () => void) => void }> = [];
+
+  constructor(private readonly limits: AssetDownloadLimits) {
+    for (const [name, value] of Object.entries(limits)) {
+      if (!Number.isSafeInteger(value) || value < 1) throw new Error(`Invalid downloadLimits.${name}: expected a positive safe integer`);
+    }
+  }
+
+  acquire(url: string, video: boolean): Promise<() => void> {
+    const host = new URL(url).hostname.toLowerCase();
+    return new Promise(resolve => {
+      this.queue.push({ host, video, resolve });
+      this.drain();
+    });
+  }
+
+  private drain(): void {
+    for (let index = 0; index < this.queue.length && this.active < this.limits.maxConcurrent;) {
+      const task = this.queue[index];
+      if ((this.hosts.get(task.host) ?? 0) >= this.limits.maxPerHost || (task.video && this.videos >= this.limits.maxVideos)) {
+        index++;
+        continue;
+      }
+      this.queue.splice(index, 1);
+      this.active++;
+      this.hosts.set(task.host, (this.hosts.get(task.host) ?? 0) + 1);
+      if (task.video) this.videos++;
+      task.resolve(() => {
+        this.active--;
+        this.hosts.set(task.host, this.hosts.get(task.host)! - 1);
+        if (task.video) this.videos--;
+        this.drain();
+      });
+    }
+  }
+}
+
+/** Bound task creation as well as transfers, so pending writes do not accumulate buffers. */
+async function forEachConcurrent<T>(items: T[], concurrency: number, visit: (item: T) => Promise<void>): Promise<void> {
+  let cursor = 0;
+  let failed = false;
+  let failure: unknown;
+  await Promise.all(Array.from({ length: Math.min(items.length, concurrency) }, async () => {
+    while (!failed && cursor < items.length) {
+      const item = items[cursor++];
+      try { await visit(item); }
+      catch (error) { failed = true; failure = error; }
+    }
+  }));
+  // Drain running tasks before propagating fatal errors; no writes outlive resolution.
+  if (failed) throw failure;
+}
 
 function downloadError(error: unknown): string {
   if (!(error instanceof Error)) return String(error);
@@ -21,53 +89,78 @@ function downloadError(error: unknown): string {
 }
 
 /** Bounded retries; redirects are manually validated so retries never bypass SSRF. */
-async function fetchStylesheet(url: string, proxyUrl?: string): Promise<{ buffer: Buffer; url: string }> {
+async function fetchAssetBytes(
+  url: string,
+  proxyUrl?: string,
+  options: { maxBytes: number; timeoutMs: number; expectedType?: 'CSS' | 'video'; sizeError?: () => Error } = {
+    maxBytes: MAX_ASSET_SIZE_BYTES, timeoutMs: FETCH_TIMEOUT_MS, expectedType: 'CSS',
+  },
+  scheduler?: AssetTransferScheduler
+): Promise<{ buffer: Buffer; url: string; contentType: string }> {
   let lastError: unknown;
   for (let attempt = 0; attempt < 3; attempt++) {
     const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
+    let timeout: ReturnType<typeof setTimeout> | undefined;
     try {
       let target = url;
       for (let redirects = 0; redirects <= 5; redirects++) {
         const ssrf = await validateUrlForSsrf(target);
-        if (!ssrf.valid) throw Object.assign(new Error(`Blocked stylesheet URL: ${ssrf.error || 'SSRF policy'}`), { permanent: true });
-        const headers = { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36', Accept: 'text/css,*/*;q=0.1' };
-        const response = proxyUrl
-          ? await fetchThroughProxy(target, proxyUrl, { signal: controller.signal, headers, maxBytes: MAX_ASSET_SIZE_BYTES })
-          : await fetch(target, { signal: controller.signal, redirect: 'manual', headers });
-        if ([301, 302, 303, 307, 308].includes(response.status)) {
-          const location = response.headers.get('location');
-          await response.body?.cancel();
-          if (!location || redirects === 5) throw Object.assign(new Error('Invalid stylesheet redirect or redirect limit exceeded'), { permanent: true });
-          target = new URL(location, target).href;
-          continue;
-        }
-        if (!response.ok) {
-          await response.body?.cancel();
-          throw Object.assign(new Error(`HTTP ${response.status}`), { permanent: !RETRYABLE_STATUSES.has(response.status) });
-        }
-        if (/text\/html|application\/xhtml/i.test(response.headers.get('content-type') || '')) {
-          await response.body?.cancel();
-          throw Object.assign(new Error('Expected CSS but received HTML (possible access challenge)'), { permanent: true });
-        }
-        const reader = response.body?.getReader();
-        const chunks: Buffer[] = [];
-        let size = 0;
-        if (reader) {
-          try {
-            for (;;) {
-              const { done, value } = await reader.read();
-              if (done) break;
-              size += value.byteLength;
-              if (size > MAX_ASSET_SIZE_BYTES) {
-                await reader.cancel();
-                throw Object.assign(new Error('Exceeded 10MB size limit'), { permanent: true });
+        if (!ssrf.valid) throw Object.assign(new Error(`Blocked ${options.expectedType === 'CSS' ? 'stylesheet' : 'asset'} URL: ${ssrf.error || 'SSRF policy'}`), { permanent: true });
+        const release = await scheduler?.acquire(target, options.expectedType === 'video');
+        timeout ??= setTimeout(() => controller.abort(), options.timeoutMs);
+        try {
+          const headers = { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36', Accept: options.expectedType === 'CSS' ? 'text/css,*/*;q=0.1' : '*/*' };
+          const response = proxyUrl
+            ? await fetchThroughProxy(target, proxyUrl, { signal: controller.signal, headers, maxBytes: options.maxBytes })
+            : await fetch(target, { signal: controller.signal, redirect: 'manual', headers });
+          if ([301, 302, 303, 307, 308].includes(response.status)) {
+            const location = response.headers.get('location');
+            await response.body?.cancel();
+            if (!location || redirects === 5) throw Object.assign(new Error('Invalid asset redirect or redirect limit exceeded'), { permanent: true });
+            target = new URL(location, target).href;
+            continue;
+          }
+          if (!response.ok) {
+            await response.body?.cancel();
+            throw Object.assign(new Error(`HTTP ${response.status}`), { permanent: !RETRYABLE_STATUSES.has(response.status) });
+          }
+          const contentType = response.headers.get('content-type') || '';
+          if (options.expectedType && /text\/html|application\/xhtml/i.test(contentType)) {
+            await response.body?.cancel();
+            throw Object.assign(new Error(`Expected ${options.expectedType} but received HTML (possible access challenge)`), { permanent: true });
+          }
+          const sizeError = () => Object.assign(options.sizeError?.() ?? new Error(`Exceeded ${options.maxBytes / (1024 * 1024)}MB size limit`), { permanent: true });
+          if (Number(response.headers.get('content-length')) > options.maxBytes) {
+            await response.body?.cancel();
+            throw sizeError();
+          }
+          const reader = response.body?.getReader();
+          const chunks: Buffer[] = [];
+          let size = 0;
+          if (reader) {
+            try {
+              for (;;) {
+                const { done, value } = await reader.read();
+                if (done) break;
+                size += value.byteLength;
+                if (size > options.maxBytes) {
+                  await reader.cancel();
+                  throw sizeError();
+                }
+                chunks.push(Buffer.from(value));
               }
-              chunks.push(Buffer.from(value));
-            }
-          } finally { reader.releaseLock(); }
+            } catch (error) {
+              await reader.cancel().catch(() => {});
+              throw error;
+            } finally { reader.releaseLock(); }
+          }
+          if (size === 0 && options.expectedType !== 'CSS') throw new Error('Empty asset response');
+          return { buffer: Buffer.concat(chunks, size), url: target, contentType };
+        } finally {
+          clearTimeout(timeout);
+          timeout = undefined;
+          release?.();
         }
-        return { buffer: Buffer.concat(chunks), url: target };
       }
     } catch (error) {
       lastError = error;
@@ -83,7 +176,38 @@ export interface InlineStyleSource {
   sourceUrl: string;
 }
 
+export interface CssProcessingLimits {
+  maxImportCount: number;
+  maxImportDepth: number;
+  /** Cumulative UTF-8 source bytes across all inline/downloaded/imported sheets. */
+  maxInputBytes: number;
+  /** Cumulative generated bytes, including recursive copies and consolidation passes. */
+  maxOutputBytes: number;
+}
+const DEFAULT_CSS_LIMITS: CssProcessingLimits = {
+  maxImportCount: 256,
+  maxImportDepth: 32,
+  maxInputBytes: 32 * 1024 * 1024,
+  maxOutputBytes: 64 * 1024 * 1024,
+};
+interface CssBudget {
+  limits: CssProcessingLimits;
+  imports: number;
+  inputBytes: number;
+  outputBytes: number;
+}
+export class CssBudgetExceededError extends Error {
+  constructor(limit: keyof CssProcessingLimits, maximum: number, source: string) {
+    super(`CSS processing budget exceeded: ${limit}=${maximum} at ${source}. Reduce stylesheet/import size or raise AssetResolutionOptions.cssLimits.${limit} for trusted sources.`);
+    this.name = 'CssBudgetExceededError';
+  }
+}
+
 export interface AssetResolutionOptions {
+  /** Shared by HTML assets, CSS dependencies, retries and redirect destinations. */
+  downloadLimits?: Partial<AssetDownloadLimits>;
+  /** Per-conversion bounds; overrides also enable deterministic small-budget tests. */
+  cssLimits?: Partial<CssProcessingLimits>;
   /** Namespace Next.js assets without changing legacy public paths by default. */
   assetRoot?: 'cloned-assets';
   /** Set false when root-relative CSS URLs still belong to the source website. */
@@ -100,7 +224,67 @@ export interface AssetResolutionResult {
   consolidatedCss: string;
 }
 
+interface DownloadContext {
+  downloaded: DownloadedAsset[];
+  missing: string[];
+  seenUrls: Set<string>;
+  seenHashes: Map<string, DownloadedAsset>;
+  assetRoot?: 'cloned-assets';
+  generatedPublicAssetUrls?: boolean;
+  proxyUrl?: string;
+  cssLimits?: Partial<CssProcessingLimits>;
+  downloadLimits?: Partial<AssetDownloadLimits>;
+}
+
 export class AssetDownloader {
+  private readonly transfers = new WeakMap<object, {
+    scheduler: AssetTransferScheduler;
+    limits: AssetDownloadLimits;
+    urls: Map<string, Promise<DownloadedAsset | null>>;
+    hashes: Map<string, Promise<DownloadedAsset>>;
+  }>();
+
+  private transferState(context: { downloadLimits?: Partial<AssetDownloadLimits> }) {
+    let state = this.transfers.get(context);
+    if (!state) {
+      const limits = { ...DEFAULT_DOWNLOAD_LIMITS, ...context.downloadLimits };
+      state = { scheduler: new AssetTransferScheduler(limits), limits, urls: new Map(), hashes: new Map() };
+      this.transfers.set(context, state);
+    }
+    return state;
+  }
+
+  private readonly cssBudgets = new WeakMap<object, CssBudget>();
+  private readonly downloadedMaps = new WeakMap<DownloadedAsset[], { count: number; exact: Map<string, string>; uniqueFilename: Map<string, string>; filenames: Map<string, Set<string>> }>();
+
+  private cssBudget(context: { cssLimits?: Partial<CssProcessingLimits> }): CssBudget {
+    const existing = this.cssBudgets.get(context);
+    if (existing) return existing;
+    const limits = { ...DEFAULT_CSS_LIMITS, ...context.cssLimits };
+    for (const [name, value] of Object.entries(limits)) {
+      if (!Number.isSafeInteger(value) || value < 0) throw new Error(`Invalid cssLimits.${name}: expected a nonnegative safe integer`);
+    }
+    const budget = { limits, imports: 0, inputBytes: 0, outputBytes: 0 };
+    this.cssBudgets.set(context, budget);
+    return budget;
+  }
+
+  private fetchCss(url: string, context: { proxyUrl?: string; cssLimits?: Partial<CssProcessingLimits>; downloadLimits?: Partial<AssetDownloadLimits> }): ReturnType<typeof fetchAssetBytes> {
+    const budget = this.cssBudget(context);
+    const remaining = budget.limits.maxInputBytes - budget.inputBytes;
+    return fetchAssetBytes(url, context.proxyUrl, {
+      maxBytes: Math.min(MAX_ASSET_SIZE_BYTES, remaining), timeoutMs: FETCH_TIMEOUT_MS, expectedType: 'CSS',
+      sizeError: remaining <= MAX_ASSET_SIZE_BYTES
+        ? () => new CssBudgetExceededError('maxInputBytes', budget.limits.maxInputBytes, url)
+        : undefined,
+    }, this.transferState(context).scheduler);
+  }
+
+  private chargeCss(budget: CssBudget, kind: 'inputBytes' | 'outputBytes', bytes: number, source: string): void {
+    const limit = kind === 'inputBytes' ? 'maxInputBytes' : 'maxOutputBytes';
+    if (bytes > budget.limits[limit] - budget[kind]) throw new CssBudgetExceededError(limit, budget.limits[limit], source);
+    budget[kind] += bytes;
+  }
   /**
    * Safely downloads collected assets, saves them to public/, consolidates CSS,
    * resolves fonts/assets referenced inside CSS, and rewrites paths to safe Next.js URLs.
@@ -125,21 +309,19 @@ export class AssetDownloader {
       assetRoot: options.assetRoot,
       generatedPublicAssetUrls: options.generatedPublicAssetUrls,
       proxyUrl: options.proxyUrl,
+      cssLimits: options.cssLimits,
+      downloadLimits: options.downloadLimits,
     };
+    const budget = this.cssBudget(context);
 
-    // 1. Download discovered HTML assets (images, fonts, icons, stylesheets)
-    for (const asset of discoveredAssets) {
-      if (asset.type === 'stylesheet') {
-        // Download stylesheet, parse internal url(...) assets, and rewrite
-        if (!options.cssSources) await this.downloadAndProcessStylesheet(conversionId, asset, cssSnippets, context);
-      } else {
-        await this.downloadAsset(
-          conversionId,
-          asset.originalUrl,
-          asset.type,
-          asset.suggestedLocalName,
-          context
-        );
+    // 1. Download independent HTML assets in a bounded pool. CSS stays in cascade order.
+    const { limits } = this.transferState(context);
+    await forEachConcurrent(discoveredAssets.filter(asset => asset.type !== 'stylesheet'), limits.maxConcurrent, async asset => {
+      await this.downloadAsset(conversionId, asset.originalUrl, asset.type, asset.suggestedLocalName, context);
+    });
+    if (!options.cssSources) {
+      for (const asset of discoveredAssets.filter(asset => asset.type === 'stylesheet')) {
+        await this.downloadAndProcessStylesheet(conversionId, asset, cssSnippets, context);
       }
     }
 
@@ -165,7 +347,9 @@ export class AssetDownloader {
     }
 
     // 3. Build consolidated CSS
-    let consolidatedCss = cssSnippets.join('\n\n/* --- Next Section Stylesheet --- */\n\n');
+    const separator = '\n\n/* --- Next Section Stylesheet --- */\n\n';
+    this.chargeCss(budget, 'outputBytes', cssSnippets.reduce((bytes, css) => bytes + Buffer.byteLength(css, 'utf8'), 0) + Math.max(0, cssSnippets.length - 1) * Buffer.byteLength(separator), 'consolidated CSS');
+    let consolidatedCss = cssSnippets.join(separator);
 
     // 4. Ensure any remaining url(...) in consolidated CSS matching downloaded originalUrls are rewritten
     for (const item of downloaded) {
@@ -175,12 +359,16 @@ export class AssetDownloader {
       }
     }
 
+    this.chargeCss(budget, 'outputBytes', Buffer.byteLength(consolidatedCss, 'utf8'), 'downloaded URL consolidation');
+
     // Prefer matching downloaded assets over malformed encoded remote URLs.
     consolidatedCss = this.localizeDownloadedAssetUrls(consolidatedCss, downloaded);
+    this.chargeCss(budget, 'outputBytes', Buffer.byteLength(consolidatedCss, 'utf8'), 'localized CSS');
 
     // 5. Final safety net: Convert ANY remaining relative url(...) to absolute so Webpack never crashes
     const defaultBaseUrl = discoveredAssets[0]?.sourcePageUrl || 'https://localhost';
     consolidatedCss = this.sanitizeRemainingRelativeUrls(consolidatedCss, defaultBaseUrl);
+    this.chargeCss(budget, 'outputBytes', Buffer.byteLength(consolidatedCss, 'utf8'), 'final CSS');
 
     return {
       downloadedAssets: downloaded,
@@ -206,6 +394,8 @@ export class AssetDownloader {
       generatedPublicAssetUrls?: boolean;
       /** Server-resolved credentials; never included in generated files or public records. */
       proxyUrl?: string;
+      cssLimits?: Partial<CssProcessingLimits>;
+      downloadLimits?: Partial<AssetDownloadLimits>;
     }
   ): Promise<void> {
     if (context.seenUrls.has(asset.originalUrl)) return;
@@ -220,7 +410,7 @@ export class AssetDownloader {
     }
 
     try {
-      const fetched = await fetchStylesheet(asset.originalUrl, context.proxyUrl);
+      const fetched = await this.fetchCss(asset.originalUrl, context);
       const rawBuffer = fetched.buffer;
 
       const rawCss = rawBuffer.toString('utf8');
@@ -259,6 +449,7 @@ export class AssetDownloader {
       context.seenHashes.set(hash, assetRecord);
       context.downloaded.push(assetRecord);
     } catch (err: unknown) {
+      if (err instanceof CssBudgetExceededError) throw err;
       const errorMsg = downloadError(err);
       logger.warn({ url: asset.originalUrl, error: errorMsg }, 'Failed to download stylesheet');
       context.missing.push(`${asset.originalUrl} (${errorMsg})`);
@@ -273,16 +464,23 @@ export class AssetDownloader {
     urlStr: string,
     typeHint: DiscoveredAsset['type'],
     suggestedName: string | undefined,
-    context: {
-      downloaded: DownloadedAsset[];
-      missing: string[];
-      seenUrls: Set<string>;
-      seenHashes: Map<string, DownloadedAsset>;
-      assetRoot?: 'cloned-assets';
-      generatedPublicAssetUrls?: boolean;
-      /** Server-resolved credentials; never included in generated files or public records. */
-      proxyUrl?: string;
-    }
+    context: DownloadContext
+  ): Promise<DownloadedAsset | null> {
+    const state = this.transferState(context);
+    const existing = state.urls.get(urlStr);
+    if (existing) return existing;
+    // Defer execution until the promise is registered, including optimizer recursion.
+    const pending = Promise.resolve().then(() => this.downloadAssetOnce(conversionId, urlStr, typeHint, suggestedName, context));
+    state.urls.set(urlStr, pending);
+    return pending;
+  }
+
+  private async downloadAssetOnce(
+    conversionId: string,
+    urlStr: string,
+    typeHint: DiscoveredAsset['type'],
+    suggestedName: string | undefined,
+    context: DownloadContext
   ): Promise<DownloadedAsset | null> {
     if (context.seenUrls.has(urlStr)) {
       return context.downloaded.find((d) => d.originalUrl === urlStr) || null;
@@ -322,32 +520,12 @@ export class AssetDownloader {
     }
 
     try {
-      const controller = new AbortController();
-      const timeout = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
-
-      const headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
-        Accept: '*/*',
-      };
-      let response: Response;
-      try {
-        response = context.proxyUrl
-          ? await fetchProxyAsset(urlStr, context.proxyUrl, { signal: controller.signal, headers, maxBytes: MAX_ASSET_SIZE_BYTES })
-          : await fetch(urlStr, { signal: controller.signal, headers });
-      } finally { clearTimeout(timeout); }
-
-      if (!response.ok) {
-        context.missing.push(`${urlStr} (HTTP ${response.status})`);
-        return null;
-      }
-
-      const arrayBuffer = await response.arrayBuffer();
-      const buffer = Buffer.from(arrayBuffer);
-
-      if (buffer.length > MAX_ASSET_SIZE_BYTES) {
-        context.missing.push(`${urlStr} (Exceeded 10MB size limit)`);
-        return null;
-      }
+      const videoHint = typeHint === 'video' || VIDEO_URL_PATTERN.test(urlStr);
+      const { buffer, contentType } = await fetchAssetBytes(urlStr, context.proxyUrl, {
+        maxBytes: videoHint ? MAX_VIDEO_SIZE_BYTES : MAX_ASSET_SIZE_BYTES,
+        timeoutMs: videoHint ? VIDEO_FETCH_TIMEOUT_MS : FETCH_TIMEOUT_MS,
+        expectedType: videoHint ? 'video' : undefined,
+      }, this.transferState(context).scheduler);
 
       if (typeHint === 'animation') {
         try {
@@ -359,11 +537,13 @@ export class AssetDownloader {
       }
 
       const hash = crypto.createHash('sha256').update(buffer).digest('hex').slice(0, 12);
-      const contentType = response.headers.get('content-type') || '';
 
-      // If duplicate content was already saved, reuse its path
-      if (context.seenHashes.has(hash)) {
-        const existing = context.seenHashes.get(hash)!;
+      // Share pending writes as well as completed files for identical content.
+      const state = this.transferState(context);
+      const pendingWrite = state.hashes.get(hash);
+      const existingHash = context.seenHashes.get(hash) ?? (pendingWrite ? await pendingWrite : undefined);
+      if (existingHash) {
+        const existing = existingHash;
         const duplicateRecord: DownloadedAsset = {
           ...existing,
           originalUrl: urlStr,
@@ -377,7 +557,9 @@ export class AssetDownloader {
       const isCss = typeHint === 'stylesheet' || contentType.includes('css') || /\.css(\?|#|$)/i.test(urlStr);
       const isIcon = typeHint === 'icon' || /\.ico(\?|#|$)/i.test(urlStr);
 
+      const isVideo = videoHint || /^video\//i.test(contentType);
       let subfolder = 'images';
+      // Keep the established asset folders: standalone export validates these paths.
       if (typeHint === 'animation') subfolder = 'animations';
       else if (isFont) subfolder = 'fonts';
       else if (isCss) subfolder = 'css';
@@ -385,15 +567,15 @@ export class AssetDownloader {
 
       const baseName =
         suggestedName ||
-        this.extractFilename(urlStr, typeHint === 'animation' ? 'animation' : isFont ? 'font' : isCss ? 'stylesheet' : isIcon ? 'icon' : 'image');
+        this.extractFilename(urlStr, isVideo ? 'video' : typeHint === 'animation' ? 'animation' : isFont ? 'font' : isCss ? 'stylesheet' : isIcon ? 'icon' : 'image');
       const normalizedBaseName = typeHint === 'animation' && !baseName.toLowerCase().endsWith('.json')
         ? `${baseName.replace(/\.[^.]+$/, '')}.json`
-        : baseName;
+        : isVideo && !baseName.includes('.')
+          ? `${baseName}.${/video\/webm/i.test(contentType) ? 'webm' : /video\/ogg/i.test(contentType) ? 'ogv' : 'mp4'}`
+          : baseName;
       const safeFilename = `${hash}_${normalizedBaseName}`;
       const publicUrl = path.posix.join('/', context.assetRoot ?? '', subfolder, safeFilename);
       const relativeProjectFile = `public${publicUrl}`;
-
-      await conversionStorage.writeFileSafe(conversionId, relativeProjectFile, buffer);
 
       const assetRecord: DownloadedAsset = {
         originalUrl: urlStr,
@@ -405,14 +587,22 @@ export class AssetDownloader {
         isSvg: contentType.includes('svg') || normalizedBaseName.endsWith('.svg'),
         isFont,
         isStylesheet: isCss,
-        isImage: subfolder === 'images' || subfolder === 'icons',
+        isImage: !isVideo && (subfolder === 'images' || subfolder === 'icons'),
       };
 
-      context.seenHashes.set(hash, assetRecord);
+      const write = Promise.resolve().then(async () => {
+        await conversionStorage.writeFileSafe(conversionId, relativeProjectFile, buffer);
+        context.seenHashes.set(hash, assetRecord);
+        return assetRecord;
+      });
+      state.hashes.set(hash, write);
+      try { await write; }
+      finally { state.hashes.delete(hash); }
       context.downloaded.push(assetRecord);
       return assetRecord;
     } catch (err: unknown) {
-      const errorMsg = err instanceof Error ? err.message : String(err);
+      if (err instanceof CssBudgetExceededError) throw err;
+      const errorMsg = downloadError(err);
       logger.warn({ url: urlStr, error: errorMsg }, 'Failed to download asset');
       context.missing.push(`${urlStr} (${errorMsg})`);
       return null;
@@ -436,9 +626,20 @@ export class AssetDownloader {
       generatedPublicAssetUrls?: boolean;
       /** Server-resolved credentials; never included in generated files or public records. */
       proxyUrl?: string;
-    }
+      cssLimits?: Partial<CssProcessingLimits>;
+      downloadLimits?: Partial<AssetDownloadLimits>;
+    },
+    importDepth = 0
   ): Promise<string> {
     if (!rawCss) return '';
+    const budget = this.cssBudget(context);
+    this.chargeCss(budget, 'inputBytes', Buffer.byteLength(rawCss, 'utf8'), cssBaseUrl);
+    // Normalize malformed data wrappers before parsing or resolving URLs. Valid
+    // data URLs remain byte-for-byte intact (including encoded SVG payloads).
+    rawCss = rawCss.replace(cssUrlPattern(), (full, raw: string) => {
+      const cleaned = unquoteCssUrl(raw);
+      return /^data:/i.test(cleaned) && !/^(?:"data:|'data:|data:)/i.test(raw.trim()) ? cssDataUrl(cleaned) : full;
+    });
 
     // Encoding directives belong to the original byte stream, not to decoded
     // UTF-8 snippets. Remove valid top-level directives before @import/media
@@ -456,27 +657,33 @@ export class AssetDownloader {
     // stylesheet that later pulls fonts from the source host.
     const importRegex = /@import\s+(?:url\(\s*)?(['"]?)([^'"\s)]+)\1\s*\)?([^;]*);/gi;
     let rewrittenCss = '';
+    const append = (css: string) => {
+      this.chargeCss(budget, 'outputBytes', Buffer.byteLength(css, 'utf8'), cssBaseUrl);
+      rewrittenCss += css;
+    };
     let cursor = 0;
     for (const match of rawCss.matchAll(importRegex)) {
-      rewrittenCss += rawCss.slice(cursor, match.index);
+      if (++budget.imports > budget.limits.maxImportCount) throw new CssBudgetExceededError('maxImportCount', budget.limits.maxImportCount, cssBaseUrl);
+      if (importDepth >= budget.limits.maxImportDepth) throw new CssBudgetExceededError('maxImportDepth', budget.limits.maxImportDepth, cssBaseUrl);
+      append(rawCss.slice(cursor, match.index));
       cursor = (match.index || 0) + match[0].length;
       const importPath = match[2].trim();
       let absoluteImport: string;
       try {
         absoluteImport = new URL(importPath, cssBaseUrl).toString();
       } catch {
-        rewrittenCss += match[0];
+        append(match[0]);
         continue;
       }
       const media = match[3].trim();
       const imported = await this.fetchImportedCss(absoluteImport, context);
-      if (imported === null) rewrittenCss += `@import url("${absoluteImport}")${media ? ` ${media}` : ''};`;
+      if (imported === null) append(`@import url("${absoluteImport}")${media ? ` ${media}` : ''};`);
       else {
-        const nested = await this.processAndRewriteCss(conversionId, imported.css, imported.url, context);
-        rewrittenCss += media ? `@media ${media} {\n${nested}\n}` : nested;
+        const nested = await this.processAndRewriteCss(conversionId, imported.css, imported.url, context, importDepth + 1);
+        append(media ? `@media ${media} {\n${nested}\n}` : nested);
       }
     }
-    rewrittenCss += rawCss.slice(cursor);
+    append(rawCss.slice(cursor));
 
     const fontRanges: Array<[number, number]> = [];
     for (const match of rewrittenCss.matchAll(/@font-face\s*\{[\s\S]*?\}/gi)) {
@@ -484,11 +691,13 @@ export class AssetDownloader {
     }
     const urlRegex = cssUrlPattern();
     const replacements = new Map<string, string>();
+    const dependencies: Array<{ rawUrl: string; absoluteUrl: string; type: DiscoveredAsset['type'] }> = [];
+    const queuedUrls = new Set<string>();
     for (const match of rewrittenCss.matchAll(urlRegex)) {
       const rawUrl = match[1].trim();
       if (/^(?:data:|blob:|#)/i.test(unquoteCssUrl(rawUrl))) continue;
       const cleanedUrl = this.canonicalizeAssetUrl(rawUrl, context.downloaded);
-      if (!cleanedUrl || /^(?:data:|blob:|#)/i.test(cleanedUrl) || replacements.has(rawUrl)) continue;
+      if (!cleanedUrl || /^(?:data:|blob:|#)/i.test(cleanedUrl) || replacements.has(rawUrl) || queuedUrls.has(rawUrl)) continue;
 
       const existingLocal = this.findDownloadedPublicUrl(cleanedUrl, context.downloaded);
       if (existingLocal) {
@@ -520,21 +729,31 @@ export class AssetDownloader {
         /format\(\s*['"]?(?:woff2?|truetype|opentype|embedded-opentype)/i.test(nearby) ||
         /\.(?:woff2?|ttf|otf|eot)(?:[?#]|$)/i.test(absoluteUrl);
       const isImage = /\.(?:png|jpe?g|gif|svg|webp|avif|ico|cur)(?:[?#]|$)/i.test(absoluteUrl);
-      const downloaded = await this.downloadAsset(
-        conversionId,
-        absoluteUrl,
-        isFont ? 'font' : isImage ? 'image' : 'other',
-        undefined,
-        context
-      );
-      replacements.set(rawUrl, downloaded?.publicUrl || absoluteUrl);
+      queuedUrls.add(rawUrl);
+      dependencies.push({ rawUrl, absoluteUrl, type: isFont ? 'font' : isImage ? 'image' : 'other' });
     }
+    await forEachConcurrent(dependencies, this.transferState(context).limits.maxConcurrent, async dependency => {
+      const downloaded = await this.downloadAsset(conversionId, dependency.absoluteUrl, dependency.type, undefined, context);
+      replacements.set(dependency.rawUrl, downloaded?.publicUrl || dependency.absoluteUrl);
+    });
+    // Charge rewritten output before allocating it; long fallback/public URLs
+    // can grow CSS substantially even when the source input was small.
+    let urlBytes = 0;
+    for (const match of rewrittenCss.matchAll(urlRegex)) {
+      const replacement = replacements.has(match[1].trim()) ? `url("${replacements.get(match[1].trim())}")` : match[0];
+      urlBytes += Buffer.byteLength(match[0], 'utf8');
+      this.chargeCss(budget, 'outputBytes', Buffer.byteLength(replacement, 'utf8'), cssBaseUrl);
+    }
+    // Non-URL text is copied by String.replace too.
+    this.chargeCss(budget, 'outputBytes', Buffer.byteLength(rewrittenCss, 'utf8') - urlBytes, cssBaseUrl);
     return rewrittenCss.replace(urlRegex, (full, rawUrl) =>
       replacements.has(rawUrl.trim()) ? `url("${replacements.get(rawUrl.trim())}")` : full
     );
   }
 
   private canonicalizeAssetUrl(value: string, downloaded: DownloadedAsset[] = []): string {
+    value = unquoteCssUrl(value);
+    if (/^(?:data:|blob:|#)/i.test(value)) return value;
     let cleaned = value
       .replace(/&quot;|&#34;|&#x22;|&apos;|&#39;|&#x27;/gi, (entity) =>
         /quot|34|22/i.test(entity) ? '"' : "'"
@@ -581,19 +800,10 @@ export class AssetDownloader {
         cleaned = `${parsed.origin}${candidate}`;
       }
       if (this.isLocalPublicAssetUrl(candidate)) {
-        const matchingSource = downloaded.find((asset) => {
-          try {
-            const original = new URL(this.canonicalizeAssetUrl(asset.originalUrl));
-            return (
-              original.origin.toLowerCase() === parsed.origin.toLowerCase() &&
-              `${original.pathname}${original.search}${original.hash}`.toLowerCase() ===
-                candidate.toLowerCase()
-            );
-          } catch {
-            return false;
-          }
-        });
-        if (matchingSource) cleaned = matchingSource.publicUrl;
+        const matchingSource = downloaded.length
+          ? this.buildDownloadedAssetMaps(downloaded).exact.get(this.normalizedAssetKey(`${parsed.origin}${candidate}`))
+          : undefined;
+        if (matchingSource) cleaned = matchingSource;
       }
     } catch {
       /* non-absolute URL */
@@ -620,9 +830,14 @@ export class AssetDownloader {
     exact: Map<string, string>;
     uniqueFilename: Map<string, string>;
   } {
-    const exact = new Map<string, string>();
-    const filenameCandidates = new Map<string, Set<string>>();
-    for (const asset of downloaded) {
+    let cached = this.downloadedMaps.get(downloaded);
+    if (!cached || cached.count > downloaded.length) {
+      cached = { count: 0, exact: new Map(), uniqueFilename: new Map(), filenames: new Map() };
+      this.downloadedMaps.set(downloaded, cached);
+    }
+    const { exact, uniqueFilename, filenames: filenameCandidates } = cached;
+    for (let index = cached.count; index < downloaded.length; index++) {
+      const asset = downloaded[index];
       exact.set(this.normalizedAssetKey(asset.originalUrl), asset.publicUrl);
       exact.set(this.normalizedAssetKey(asset.publicUrl), asset.publicUrl);
       const names = [asset.originalUrl, asset.publicUrl]
@@ -644,12 +859,11 @@ export class AssetDownloader {
         const candidates = filenameCandidates.get(name) ?? new Set<string>();
         candidates.add(asset.publicUrl);
         filenameCandidates.set(name, candidates);
+        if (candidates.size === 1) uniqueFilename.set(name, asset.publicUrl);
+        else uniqueFilename.delete(name);
       }
     }
-    const uniqueFilename = new Map<string, string>();
-    for (const [name, candidates] of filenameCandidates) {
-      if (candidates.size === 1) uniqueFilename.set(name, [...candidates][0]);
-    }
+    cached.count = downloaded.length;
     return { exact, uniqueFilename };
   }
 
@@ -681,6 +895,8 @@ export class AssetDownloader {
       generatedPublicAssetUrls?: boolean;
       /** Server-resolved credentials; never included in generated files or public records. */
       proxyUrl?: string;
+      cssLimits?: Partial<CssProcessingLimits>;
+      downloadLimits?: Partial<AssetDownloadLimits>;
     }
   ): Promise<{ css: string; url: string } | null> {
     if (context.seenUrls.has(url)) return { css: '', url }; // cycle/deduplication
@@ -691,9 +907,10 @@ export class AssetDownloader {
       return null;
     }
     try {
-      const fetched = await fetchStylesheet(url, context.proxyUrl);
+      const fetched = await this.fetchCss(url, context);
       return { css: fetched.buffer.toString('utf8'), url: fetched.url };
     } catch (error) {
+      if (error instanceof CssBudgetExceededError) throw error;
       context.missing.push(
         `${url} (Nested CSS import failed: ${downloadError(error)})`
       );
@@ -707,7 +924,8 @@ export class AssetDownloader {
   private localizeDownloadedAssetUrls(css: string, downloaded: DownloadedAsset[]): string {
     const maps = this.buildDownloadedAssetMaps(downloaded);
     return css.replace(cssUrlPattern(), (full, rawUrl) => {
-      if (/^(?:data:|blob:|#)/i.test(unquoteCssUrl(rawUrl))) return full;
+      const unquoted = unquoteCssUrl(rawUrl);
+      if (/^(?:data:|blob:|#)/i.test(unquoted)) return /^data:/i.test(unquoted) && !/^(?:"data:|'data:|data:)/i.test(rawUrl.trim()) ? cssDataUrl(unquoted) : full;
       const cleaned = this.canonicalizeAssetUrl(rawUrl, downloaded);
       if (!cleaned || /^(?:data:|blob:|#)/i.test(cleaned)) return full;
       const exact = maps.exact.get(this.normalizedAssetKey(cleaned));
@@ -730,7 +948,8 @@ export class AssetDownloader {
 
   private sanitizeRemainingRelativeUrls(css: string, baseUrl: string): string {
     return css.replace(cssUrlPattern(), (match, rawUrl) => {
-      if (/^(?:data:|blob:|#)/i.test(unquoteCssUrl(rawUrl))) return match;
+      const unquoted = unquoteCssUrl(rawUrl);
+      if (/^(?:data:|blob:|#)/i.test(unquoted)) return /^data:/i.test(unquoted) && !/^(?:"data:|'data:|data:)/i.test(rawUrl.trim()) ? cssDataUrl(unquoted) : match;
       const cleaned = this.canonicalizeAssetUrl(rawUrl);
       if (!cleaned || /^(?:data:|blob:|#)/i.test(cleaned)) return match;
       if (this.isLocalPublicAssetUrl(cleaned) || /^https?:\/\//i.test(cleaned)) {
@@ -755,7 +974,7 @@ export class AssetDownloader {
         else if (type === 'font') filename += '.woff2';
         else if (type === 'stylesheet') filename += '.css';
         else if (type === 'icon') filename += '.ico';
-        else filename += '.png';
+        else if (type !== 'video') filename += '.png';
       }
       return filename;
     } catch {

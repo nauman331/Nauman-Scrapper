@@ -51,6 +51,29 @@ describe.skipIf(!hasBrowser)('CSSOM snapshot and styled HTML export', () => {
     } finally { await browser.close(); }
   }, 15000);
 
+  it('preserves canvas chart pixels and display size in script-free snapshots while leaving SVG intact', async () => {
+    const browser = await launchBrowser();
+    try {
+      const page = await browser.newPage();
+      await page.setContent('<style>canvas{display:block}</style><canvas id="chart" width="800" height="400" style="width:400px;height:200px" aria-label="Price index"></canvas><svg id="bars" viewBox="0 0 100 50"><rect width="20" height="40" fill="red"/></svg>');
+      const sourcePixels = await page.locator('canvas').evaluate(canvas => {
+        const ctx = canvas.getContext('2d')!;
+        ctx.fillStyle = '#b29962'; ctx.fillRect(0, 0, 800, 400);
+        ctx.fillStyle = '#ffffff'; ctx.fillRect(30, 30, 100, 80);
+        return canvas.toDataURL('image/png');
+      });
+      const snapshot = await captureRenderedHtml(page);
+      const dom = cheerio.load(snapshot);
+      expect(dom('canvas')).toHaveLength(0);
+      expect(dom('img[data-captured-canvas]').attr('src')).toBe(sourcePixels);
+      expect(dom('#bars rect').attr('fill')).toBe('red');
+      await page.setContent(snapshot);
+      const image = page.locator('#chart');
+      await expect.poll(() => image.evaluate((element: HTMLImageElement) => element.complete)).toBe(true);
+      expect(await image.evaluate(element => ({ width: element.getBoundingClientRect().width, height: element.getBoundingClientRect().height }))).toEqual({ width: 400, height: 200 });
+    } finally { await browser.close(); }
+  }, 15000);
+
   it('marks opaque fixed consent banners without marking inline newsletter sections', async () => {
     const browser = await launchBrowser();
     try {
@@ -149,6 +172,32 @@ describe.skipIf(!hasBrowser)('CSSOM snapshot and styled HTML export', () => {
       expect(await page.evaluate(() => scrollY)).toBe(0);
     } finally { await browser.close(); }
   }, 10000);
+
+  it('keeps readable parent CSS when a cross-origin import is inaccessible and later downloads are denied', async () => {
+    const browser = await launchBrowser();
+    const id = `partial_cssom_${Date.now()}`;
+    try {
+      const page = await browser.newPage();
+      await page.route('https://parent.test/**', route => {
+        if (route.request().url().endsWith('/main.css')) return route.fulfill({ contentType: 'text/css', body: '@import url("https://fonts.test/font.css") screen; .hero{display:flex;color:rgb(12,34,56)}' });
+        return route.fulfill({ contentType: 'text/html', body: '<link rel="stylesheet" href="/main.css"><div class="hero">Readable parent</div>' });
+      });
+      await page.route('https://fonts.test/**', route => route.fulfill({ contentType: 'text/css', body: '.hero{font-family:Arial}' }));
+      await page.goto('https://parent.test/');
+      const html = await captureRenderedHtml(page);
+      const dom = cheerio.load(html);
+      expect(dom('link[rel~="stylesheet"]')).toHaveLength(0);
+      expect(dom('style[data-captured-stylesheet]').text()).toContain('display: flex');
+      expect(dom('style[data-captured-stylesheet]').text()).toContain('@import url("https://fonts.test/font.css") screen');
+      const fetch = vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response('<html>Denied</html>', { status: 403 }));
+      try {
+        await exportStandaloneHtml({ conversionId: id, jobId: 'test', targetUrl: 'https://parent.test/', domain: 'parent.test', pages: [{ url: 'https://parent.test/', rawData: { html } }], options: HtmlConversionOptionsSchema.parse({ cssStrategy: 'tailwind' }) });
+        expect(fetch.mock.calls.some(([url]) => String(url).includes('parent.test/main.css'))).toBe(false);
+        const output = await conversionStorage.readFileSafe(id, 'index.html');
+        expect(output).toContain('flex');
+      } finally { fetch.mockRestore(); }
+    } finally { await browser.close(); await conversionStorage.deleteConversion(id); }
+  }, 30000);
 
   it('captures session-loaded external CSS in order, including imported asset bases and link media', async () => {
     const browser = await launchBrowser();
